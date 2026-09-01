@@ -45,7 +45,7 @@
 | G8 | 导出用 `file_index`（0,1,2…）而非文件名，且格式硬编码 | P1 | §7.8 导出**原始行**，前缀可选，前缀用文件名 |
 | G9 | 无空文件 / 单行无换行 / BOM / CRLF 处理约定 | P1 | §7.1 明确边界规则，配单测 |
 | G10 | 无错误展示规范（仅 `eprintln!`） | P1 | §8 用 `log` + 状态栏内联错误条 |
-| G11 | 无打包 / 分发约定 | P2 | §13 开放问题（MVP 用 `cargo build --release`） |
+| G11 | 打包 / 分发：MVP 交付 `cargo build --release` 产物；M10 额外提供 `scripts/package_macos.sh` 生成可分发 `HyperLog.app`（可拖入 Applications），提前交付 | M10 ✅ | §12.12 / scripts/package_macos.sh |
 | G12 | 无 Follow / tail 实时追加 | P2 | **明确排除在本 Spec 范围外** |
 
 ### 1.3 PRD 设计缺陷（代码级 Review）
@@ -114,7 +114,7 @@
 9. **依赖版本**：以 PRD §3.2 指定版本为基线（`egui`/`eframe` 0.36.1 等）；实现时若 `cargo add` 解析出更高兼容版本，需在此表更新并记录理由。
 10. **代码组织**：允许偏离 PRD §3.1 的三文件结构，按 §6 拆分模块（对应 D13）。
 11. **日志与可观测性**：引入 `log` + `env_logger`，替代 PRD 中的裸 `println!`/`eprintln!`。
-12. **分发**：MVP 不打包安装包，交付 `cargo build --release` 产物。
+12. **分发**：MVP 交付 `cargo build --release` 产物；M10 起额外提供 `scripts/package_macos.sh` 生成 `HyperLog.app`（含 Info.plist + ad-hoc 签名 + zip），可直接拖入 `/Applications` 分发。
 
 ---
 
@@ -799,6 +799,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | **M7** | ✅ 完成 | 见 §14（检索块级并行化，P7/P8 余量加固） |
 | **M8** | ✅ 完成 | 见 §14（P9/P10/P11 验收测试 + 抗抖动测量方法） |
 | **M9** | ✅ 完成 | 见 §14（性能 HUD 可观测化 P4/P5/P6/P12 + P2 验收测试 + §8.4 空闲重绘策略确认） |
+| **M10** | ✅ 完成 | 见 §14（打包：scripts/package_macos.sh → HyperLog.app + zip，提前交付 G11） |
 
 > 说明：M1/M2 合并于同一提交，因为 `core::indexer` 的 API 必须被 UI 消费后才不会触发
 > `clippy -D warnings` 的 dead_code 门禁，单独提交索引器会使 CI 在合并前变红。
@@ -841,3 +842,4 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-02 | M8 验收补全：新增 P9/P10/P11 的 `#[ignore]` 行为测试（`progress_rate_le_20_per_s` 计数 `Partial` 消息断言 ≤20 条/秒；`cancel_response_under_500ms` 50ms 后取消断言延迟 <500ms；`export_1m_lines_under_10s` 导出 100 万行断言 <10s/104MB）；并修正测量方法抗环境抖动——P1/P9/P10/P11 先 `std::fs::read` 预热页缓存，P7/P8 连跑 3 次取峰值吞吐。最终实测 P1=1.26s、P7 峰值 1360 MB/s、P8 峰值 2275 MB/s、P9=9.1 条/秒、P10=5.8ms、P11=356ms/104MB，全部达标；clippy/fmt/24 单测/6 ignore 测试/发布窗口烟测均绿 | Agent |
 | 2026-09-02 | M9 GUI 验收可观测化：① 新增性能 HUD（`AppState.show_perf`，工具栏「性能」按钮或 `HYPER_LOG_PERF=1` 开启），`logic()` 用 `ctx.input().time` 累计帧耗时环形缓冲，`ui()` 以 `egui::Window` 显示 FPS/帧耗时/p95/峰值，供 P4(p95<16.6ms)/P5(虚拟滚动)/P6(峰值<50ms) 现场观测；② `indexer.rs::open_10gb_under_20s` 新增 P2 `#[ignore]` 验收（需自备 10GB 样本）；③ 确认 §8.4 空闲重绘策略：`logic()` 仅检索/导出中 `request_repaint()`，空闲不重绘 → P12 空闲 CPU<2% 由设计保证，HUD 自身也不触发重绘。clippy/fmt/24 单测/7 ignore/发布烟测均绿 | Agent |
 | 2026-09-02 | P2 实测验收闭环：生成 10GB 样本（`scripts/gen_log.sh /tmp/bench_10gb.log 100000000` → 9.7G/1 亿行），运行 `open_10gb_under_20s` 预热页缓存后实测 `open` 耗时 **15.52 s**（< 20s 阈值）→ P2 ✅ 余量充足。§11.2.1 增补 P2 实测行、§14 本行记录 | Agent |
+| 2026-09-02 | M10 提前交付打包（G11）：新增 `scripts/package_macos.sh`，`cargo build --release` 后组装 `dist/HyperLog.app`（Info.plist + 二进制 + ad-hoc 签名），并打包 `dist/HyperLog-macos.zip`（5.3M）；冒烟验证 `.app` 内二进制启动 ALIVE（Glow）。G11 由「P2 待定」改为 M10 ✅；§12.12 增补 `.app` 分发说明；§12.1 增 M10 | Agent |
