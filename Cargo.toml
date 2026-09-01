@@ -16,6 +16,8 @@ memmap2 = "0.9"
 rayon = "1.10"
 regex = "1.10"
 crossbeam-channel = "0.5.16"
+# 字节级 SIMD 检索 / 行偏移并行扫描（P1/P8 性能验收，spec §11.2）
+memchr = "2.7"
 
 # Filesystem and dialog interaction
 rfd = "0.15"

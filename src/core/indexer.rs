@@ -8,7 +8,9 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use memchr::memchr;
 use memmap2::Mmap;
+use rayon::prelude::*;
 use thiserror::Error;
 
 /// 单次加载允许的最大文件体积：16 GiB。
@@ -94,17 +96,8 @@ impl LogFileIndex {
         let content_start = if mmap.starts_with(BOM) { BOM.len() } else { 0 };
         let body = &mmap[content_start..];
 
-        // 预估平均行长 80 B，减少首次扩容；offsets 存的是「相对 mmap 的绝对偏移」。
-        let mut line_offsets = Vec::with_capacity(body.len() / 80 + 1);
-        if !body.is_empty() {
-            line_offsets.push(content_start); // 第一行从内容起点开始
-        }
-        for (i, &b) in body.iter().enumerate() {
-            if b == b'\n' && i + 1 < body.len() {
-                // 非末尾的 `\n` 之后即为下一行起点（绝对偏移 = content_start + i + 1）
-                line_offsets.push(content_start + i + 1);
-            }
-        }
+        // 行偏移索引：并行分块 + SIMD 扫描（M6 性能优化，对应 P1 < 2.0 s）。
+        let line_offsets = build_line_offsets(body, content_start);
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -203,6 +196,38 @@ impl LogFileIndex {
         };
         (end - start) as u64
     }
+
+    /// 整段 mmap 原始字节（含 BOM），供检索做字节级 SIMD 匹配，不触发 UTF-8 校验。
+    #[inline]
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.mmap[..]
+    }
+
+    /// 行区间 `[lo, hi)` 覆盖的字节区间 `[start, end)`（含行尾），边界对齐到行起点。
+    /// 检索按块对这段字节做整体 `find_iter`，避免逐行调度开销（M6 P8 优化）。
+    #[inline]
+    pub fn byte_range(&self, lo: usize, hi: usize) -> (usize, usize) {
+        let start = self.line_offsets.get(lo).copied().unwrap_or(0);
+        let end = if hi < self.line_count() {
+            self.line_offsets
+                .get(hi)
+                .copied()
+                .unwrap_or(self.mmap.len())
+        } else {
+            self.mmap.len()
+        };
+        (start, end)
+    }
+
+    /// 绝对字节偏移 → 所在行号（0-based）。`line_offsets` 升序，二分定位。
+    /// 检索把字节级命中偏移映射回行号时使用（M6 P8 优化）。
+    #[inline]
+    pub fn line_index_of_byte(&self, abs_offset: usize) -> usize {
+        match self.line_offsets.binary_search(&abs_offset) {
+            Ok(k) => k,
+            Err(k) => k.saturating_sub(1),
+        }
+    }
 }
 
 impl FileSet {
@@ -290,6 +315,58 @@ fn strip_eol(mmap: &[u8], mut end: usize, start: usize) -> usize {
         }
     }
     end
+}
+
+/// 并行构建「行号 → 字节偏移」索引（spec §11.2 P1，M6 优化）。
+///
+/// `body` 按核数切成字节块，每块用 `memchr` 做 SIMD 换行扫描；各块产出互不重叠、
+/// 内部升序的偏移段，主线程按块顺序拼接即得全局升序索引。
+/// 末尾换行不生成「下一行起点」（与单线程语义一致：`open` 中 `i + 1 < body.len()`）。
+fn build_line_offsets(body: &[u8], content_start: usize) -> Vec<usize> {
+    let len = body.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let ncpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+    let chunk_size = (len / ncpus).max(1);
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(ncpus);
+    let mut s = 0usize;
+    while s < len {
+        let e = (s + chunk_size).min(len);
+        ranges.push((s, e));
+        s = e;
+    }
+    // 仅当整段以 `\n` 结尾时，最后一个块需扣除该末尾换行（不开启新行）。
+    let trailing_newline = body[len - 1] == b'\n';
+
+    let per_chunk: Vec<Vec<usize>> = ranges
+        .par_iter()
+        .enumerate()
+        .map(|(k, &(cs, ce))| {
+            let mut v = Vec::new();
+            let mut pos = cs;
+            while let Some(p) = memchr(b'\n', &body[pos..ce]) {
+                let abs = pos + p; // 相对 body 的偏移
+                // 末尾换行不开启新行（仅最后一个块、且整段以 \n 结尾时扣除）。
+                if !(k + 1 == ranges.len() && trailing_newline && abs + 1 == len) {
+                    v.push(content_start + abs + 1);
+                }
+                pos = abs + 1;
+            }
+            v
+        })
+        .collect();
+
+    let total = 1 + per_chunk.iter().map(|v| v.len()).sum::<usize>();
+    let mut offsets = Vec::with_capacity(total);
+    offsets.push(content_start); // 首行起点
+    for v in per_chunk {
+        offsets.extend(v);
+    }
+    offsets
 }
 
 #[cfg(test)]
@@ -387,5 +464,57 @@ mod tests {
     fn index_memory_is_eight_bytes_per_line() {
         let idx = LogFileIndex::open(fixture("crlf.log")).unwrap();
         assert_eq!(idx.index_memory_bytes(), idx.line_count() * 8);
+    }
+
+    /// 大文件性能验收（spec §11.2，对应 T19）。
+    ///
+    /// 这些用例默认被 `#[ignore]` 跳过；需先用 `scripts/gen_log.sh /tmp/bench_1gb.log 10000000`
+    /// 生成样本，再在 **release** 下运行：
+    ///
+    /// ```bash
+    /// cargo test --release -- --ignored open_1gb_under_2s index_memory_within_budget
+    /// ```
+    #[cfg(test)]
+    mod perf {
+        use super::*;
+
+        const BENCH_1GB: &str = "/tmp/bench_1gb.log";
+
+        fn require_sample() -> PathBuf {
+            let p = PathBuf::from(BENCH_1GB);
+            assert!(
+                p.exists(),
+                "缺少性能样本 {BENCH_1GB}；请先运行：scripts/gen_log.sh {BENCH_1GB} 10000000"
+            );
+            p
+        }
+
+        /// P1：打开 1 GB（≈1000 万行）< 2.0 s
+        #[test]
+        #[ignore]
+        fn open_1gb_under_2s() {
+            let p = require_sample();
+            let start = std::time::Instant::now();
+            let idx = LogFileIndex::open(&p).expect("open");
+            let elapsed = start.elapsed();
+            println!("open 1GB: {elapsed:?} ({} 行)", idx.line_count());
+            assert!(elapsed.as_secs_f64() < 2.0, "P1 未达标：{elapsed:?}");
+        }
+
+        /// P3：索引常驻内存 ≤ 8 B/行
+        #[test]
+        #[ignore]
+        fn index_memory_within_budget() {
+            let p = require_sample();
+            let idx = LogFileIndex::open(&p).expect("open");
+            let per_line = idx.index_memory_bytes() as f64 / idx.line_count() as f64;
+            println!(
+                "索引内存 {:.2} B/行 ({} 字节 / {} 行)",
+                per_line,
+                idx.index_memory_bytes(),
+                idx.line_count()
+            );
+            assert!(per_line <= 8.0, "P3 未达标：{per_line:.2} B/行");
+        }
     }
 }

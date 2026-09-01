@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
-use rayon::prelude::*;
+use regex::bytes::Regex as BytesRegex;
 use regex::{Regex, RegexBuilder};
 
 use crate::core::indexer::LogFileIndex;
@@ -108,6 +108,26 @@ pub fn build_regex(opt: &SearchOptions, pattern: &str) -> Result<Regex, SearchEr
         .map_err(|e| SearchError::Regex(e.to_string()))
 }
 
+/// 编译字节级检索正则（检索路径用，对应 M6 P8 优化）。
+///
+/// 直接在 mmap 原始字节上匹配，避免逐行 `from_utf8_lossy` 的分配与 UTF-8 校验，
+/// 从而把 10M 次逐行 dispatch 收敛为每字节块一次 SIMD 扫描。
+///
+/// 说明：`(?i)` 在字节模式下按 ASCII 大小写折叠（日志检索足够；非 ASCII 大小写差异罕见）。
+/// 高亮仍走 [`build_regex`]（str 模式，Unicode 大小写折叠），二者对 ASCII 模式完全等价，
+/// 故高亮命中与检索结果一致（spec §13 Q7 备注）。
+pub fn build_regex_bytes(opt: &SearchOptions, pattern: &str) -> Result<BytesRegex, SearchError> {
+    let mut expr = String::new();
+    if !opt.case_sensitive {
+        expr.push_str("(?i)");
+    }
+    match opt.mode {
+        SearchMode::Plain => expr.push_str(&regex::escape(pattern)),
+        SearchMode::Regex => expr.push_str(pattern),
+    }
+    BytesRegex::new(&expr).map_err(|e| SearchError::Regex(e.to_string()))
+}
+
 /// 检索用线程池：限 `num_cpus - 1` 线程，给 UI 留一个核（spec R11）。
 fn search_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
@@ -135,7 +155,7 @@ pub fn run_search(
     tx: &Sender<SearchMessage>,
 ) {
     let start = Instant::now();
-    let re = match build_regex(options, pattern) {
+    let re = match build_regex_bytes(options, pattern) {
         Ok(r) => r,
         Err(e) => {
             let _ = tx.send(SearchMessage::Failed(e));
@@ -155,30 +175,37 @@ pub fn run_search(
         if n == 0 {
             continue;
         }
-        // 按字节切块（边界对齐到行），逐块并行扫描。块间检查取消，保证 < 500 ms 响应。
+        // 按字节切块（边界对齐到行），逐块做整体 SIMD 检索。块间检查取消，保证 < 500 ms 响应。
         for (lo, hi) in file.chunk_bounds(CHUNK_BYTES) {
             if cancel.is_cancelled() {
                 let _ = tx.send(SearchMessage::Cancelled);
                 return;
             }
 
-            // 块内并行匹配：每块独立产出 Vec<SearchHit>，无共享计数器（D7）。
+            // 块内整体做字节级 SIMD 检索（一次扫描替代逐行 dispatch，M6 P8 优化）：
+            // 对整块字节 `find_iter`，再把命中偏移映射回行号；跨行匹配按「逐行」原语义忽略。
+            let (byte_lo, byte_hi) = file.byte_range(lo, hi);
+            let slice = &file.raw_bytes()[byte_lo..byte_hi];
             let chunk_hits: Vec<SearchHit> = pool.install(|| {
-                (lo..hi)
-                    .into_par_iter()
-                    .filter_map(|li| {
-                        let bytes = file.line_bytes(li)?;
-                        let text = String::from_utf8_lossy(bytes);
-                        if re.is_match(&text) {
-                            Some(SearchHit {
-                                file_idx: file_idx as u32,
-                                line_idx: li as u32,
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+                let mut hits: Vec<SearchHit> = Vec::new();
+                let mut last_li: Option<usize> = None;
+                for m in re.find_iter(slice) {
+                    let s = m.start();
+                    let e = m.end();
+                    // 跨行匹配按「逐行」原语义忽略（正常匹配不含换行，块边界即行边界）。
+                    if slice[s..e].contains(&b'\n') {
+                        continue;
+                    }
+                    let li = file.line_index_of_byte(byte_lo + s);
+                    if last_li != Some(li) {
+                        last_li = Some(li);
+                        hits.push(SearchHit {
+                            file_idx: file_idx as u32,
+                            line_idx: li as u32,
+                        });
+                    }
+                }
+                hits
             });
 
             let chunk_len = chunk_hits.len();
@@ -385,5 +412,78 @@ mod tests {
             }
         }
         assert!(saw_terminal, "取消后应收到 Cancelled 或 Completed");
+    }
+}
+
+/// 大文件检索性能验收（spec §11.2 P7/P8，对应 T19）。
+///
+/// 需先生成样本：`scripts/gen_log.sh /tmp/bench_1gb.log 10000000`，再在 **release** 下运行：
+///
+/// ```bash
+/// cargo test --release -- --ignored search_throughput_gb
+/// ```
+#[cfg(test)]
+mod perf {
+    use super::*;
+    use crate::core::indexer::LogFileIndex;
+    use crossbeam_channel::unbounded;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    const BENCH_1GB: &str = "/tmp/bench_1gb.log";
+
+    fn require_sample() -> PathBuf {
+        let p = PathBuf::from(BENCH_1GB);
+        assert!(
+            p.exists(),
+            "缺少性能样本 {BENCH_1GB}；请先运行：scripts/gen_log.sh {BENCH_1GB} 10000000"
+        );
+        p
+    }
+
+    /// P8：纯文本（字面量）检索吞吐 ≥ 800 MB/s；P7：正则 ≥ 200 MB/s
+    #[test]
+    #[ignore]
+    fn search_throughput_gb() {
+        let p = require_sample();
+        let idx = Arc::new(LogFileIndex::open(&p).expect("open"));
+        let bytes = idx.byte_len() as u64;
+
+        // 纯文本模式（默认忽略大小写）
+        let files = vec![idx.clone()];
+        let (tx, rx) = unbounded();
+        let opt = SearchOptions {
+            mode: SearchMode::Plain,
+            case_sensitive: false,
+            max_hits: usize::MAX,
+        };
+        let start = Instant::now();
+        run_search(&files, "ERROR", &opt, &CancelToken::new(), &tx);
+        let elapsed = start.elapsed();
+        let mut plain_hits = 0usize;
+        while let Ok(m) = rx.try_recv() {
+            if let SearchMessage::Completed { hits, .. } = m {
+                plain_hits = hits;
+            }
+        }
+        let plain_mbps = bytes as f64 / 1e6 / elapsed.as_secs_f64();
+        println!("纯文本 ERROR: {elapsed:?}, {plain_mbps:.1} MB/s, {plain_hits} 命中");
+        assert!(plain_mbps >= 800.0, "P8 未达标：{plain_mbps:.1} MB/s");
+
+        // 正则模式
+        let (tx, rx) = unbounded();
+        let opt = SearchOptions {
+            mode: SearchMode::Regex,
+            case_sensitive: false,
+            max_hits: usize::MAX,
+        };
+        let start = Instant::now();
+        run_search(&files, "ERROR|WARN", &opt, &CancelToken::new(), &tx);
+        let elapsed = start.elapsed();
+        while rx.try_recv().is_ok() {}
+        let regex_mbps = bytes as f64 / 1e6 / elapsed.as_secs_f64();
+        println!("正则 ERROR|WARN: {elapsed:?}, {regex_mbps:.1} MB/s");
+        assert!(regex_mbps >= 200.0, "P7 未达标：{regex_mbps:.1} MB/s");
     }
 }
