@@ -46,7 +46,7 @@ pub struct LogFileIndex {
 }
 
 /// 多文件集合：把「文件 i 的第 j 行」统一映射为 `0..total_lines` 的全局行号。
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FileSet {
     files: Vec<Arc<LogFileIndex>>,
     /// cumulative[i] = 前 i 个文件的行数之和，长度 = files.len() + 1。

@@ -1,8 +1,10 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 use regex::Regex;
 
+use crate::core::export::{ExportFormat, ExportMessage};
 use crate::core::indexer::{FileSet, IndexError, LogFileIndex};
 use crate::core::search::{
     CancelToken, SearchError, SearchHit, SearchMessage, SearchMode, SearchOptions,
@@ -55,6 +57,22 @@ pub struct AppState {
     pub pending_search: bool,
     /// toolbar 置位后，在 `ui` 中取消检索。
     pub pending_stop: bool,
+
+    // —— 导出相关（M5 / T17）——
+    /// 导出是否带 `<文件名>:<行号>:` 前缀（默认关，仅原始行，见 §7.8 / plan Q5）。
+    pub export_with_prefix: bool,
+    /// 是否正在导出（禁用「打开/搜索/导出」，保留「取消导出」，见 T17）。
+    pub is_exporting: bool,
+    /// 导出进度（已写行数, 总行数）。
+    pub export_progress: (usize, usize),
+    /// 导出失败原因（内联红字，不 panic）。
+    pub export_error: Option<String>,
+    /// 最近一次成功导出的目标路径（用于状态栏展示）。
+    pub export_path: Option<PathBuf>,
+    /// toolbar 置位后，在 `ui` 中弹出保存对话框并启动导出。
+    pub pending_export: bool,
+    /// toolbar 置位后，在 `ui` 中取消导出。
+    pub pending_export_cancel: bool,
 }
 
 pub struct LogViewerApp {
@@ -63,17 +81,26 @@ pub struct LogViewerApp {
     search_rx: Receiver<SearchMessage>,
     /// 当前检索的取消令牌；完成后置 `None`。
     search_cancel: Option<CancelToken>,
+    /// 导出后台消息通道。
+    export_tx: Sender<ExportMessage>,
+    export_rx: Receiver<ExportMessage>,
+    /// 当前导出的取消令牌；完成后置 `None`。
+    export_cancel: Option<CancelToken>,
 }
 
 impl LogViewerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         log::info!("Hyper Log starting up");
         let (search_tx, search_rx) = crossbeam_channel::unbounded();
+        let (export_tx, export_rx) = crossbeam_channel::unbounded();
         Self {
             state: AppState::default(),
             search_tx,
             search_rx,
             search_cancel: None,
+            export_tx,
+            export_rx,
+            export_cancel: None,
         }
     }
 
@@ -179,6 +206,76 @@ impl LogViewerApp {
         });
     }
 
+    /// 通过系统原生保存对话框选择导出目标，并启动后台流式导出（M5 / T17）。
+    ///
+    /// 与检索复用同一份命中坐标；`Arc` 共享 FileSet 与命中 Vec，引擎内部不再 clone 大对象。
+    fn start_export(&mut self, dest: PathBuf) {
+        if self.state.search_results.is_empty() {
+            return;
+        }
+        if self.state.fileset.file_count() == 0 {
+            self.state.status_text = "没有可导出的文件".to_owned();
+            return;
+        }
+
+        let files = Arc::new(self.state.fileset.clone());
+        let hits = Arc::new(self.state.search_results.clone());
+        let format = if self.state.export_with_prefix {
+            ExportFormat::WithPrefix
+        } else {
+            ExportFormat::RawLines
+        };
+
+        let cancel = CancelToken::new();
+        self.export_cancel = Some(cancel.clone());
+        self.state.is_exporting = true;
+        self.state.export_progress = (0, hits.len());
+        self.state.export_error = None;
+        self.state.export_path = None;
+        self.state.status_text = "导出中…".to_owned();
+
+        let tx = self.export_tx.clone();
+        std::thread::spawn(move || {
+            crate::core::export::export_async(files, hits, dest, format, cancel, tx);
+        });
+    }
+
+    /// 处理一条后台导出消息（由 `logic` 每帧 drain）。
+    fn handle_export_msg(&mut self, msg: ExportMessage) {
+        match msg {
+            ExportMessage::Progress { done, total } => {
+                self.state.export_progress = (done, total);
+                let pct = if total > 0 {
+                    done as f64 / total as f64 * 100.0
+                } else {
+                    100.0
+                };
+                self.state.status_text = format!("导出中… {pct:.0}%");
+            }
+            ExportMessage::Completed { path, bytes } => {
+                self.state.is_exporting = false;
+                self.export_cancel = None;
+                self.state.export_path = Some(path.clone());
+                self.state.status_text = format!(
+                    "导出完成：{} ({} 字节)",
+                    path.display(),
+                    crate::util::human_bytes(bytes)
+                );
+            }
+            ExportMessage::Failed(e) => {
+                self.state.is_exporting = false;
+                self.export_cancel = None;
+                self.state.export_error = Some(e);
+                self.state.status_text = "导出失败，见状态栏".to_owned();
+            }
+            ExportMessage::Cancelled => {
+                self.state.is_exporting = false;
+                self.export_cancel = None;
+                self.state.status_text = "已取消导出".to_owned();
+            }
+        }
+    }
+
     /// 处理一条后台检索消息（由 `logic` 每帧 drain）。
     fn handle_search_msg(&mut self, msg: SearchMessage) {
         match msg {
@@ -241,8 +338,18 @@ impl eframe::App for LogViewerApp {
                 Err(_) => break,
             }
         }
+        // 导出消息与检索消息使用独立通道，但共享每帧 drain 上限。
+        while n < MAX_MSG_PER_FRAME {
+            match self.export_rx.try_recv() {
+                Ok(msg) => {
+                    self.handle_export_msg(msg);
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
         // 仅后台有活动时才请求重绘，空闲时不烧 CPU（spec §8.4）。
-        if self.state.is_searching {
+        if self.state.is_searching || self.state.is_exporting {
             ctx.request_repaint();
         }
     }
@@ -261,6 +368,27 @@ impl eframe::App for LogViewerApp {
         if self.state.pending_open && !self.state.is_searching {
             self.state.pending_open = false;
             self.open_files();
+        }
+        if self.state.pending_export {
+            self.state.pending_export = false;
+            // 保存对话框：默认文件名带本地时间戳（spec T17）。
+            let default_name = format!(
+                "hyper-log-export-{}.log",
+                crate::util::export_filename_stamp()
+            );
+            let picked = rfd::FileDialog::new()
+                .set_title("导出检索结果")
+                .set_file_name(&default_name)
+                .save_file();
+            if let Some(path) = picked {
+                self.start_export(path);
+            }
+        }
+        if self.state.pending_export_cancel {
+            self.state.pending_export_cancel = false;
+            if let Some(c) = &self.export_cancel {
+                c.cancel();
+            }
         }
 
         toolbar::show(ui, &mut self.state);

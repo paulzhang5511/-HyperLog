@@ -15,3 +15,8 @@ pub fn human_bytes(n: u64) -> String {
         format!("{value:.2} {}", UNITS[unit])
     }
 }
+
+/// 导出默认文件名用的本地日历时间戳：`YYYYMMDD-HHMMSS`（spec T17）。
+pub fn export_filename_stamp() -> String {
+    chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
+}

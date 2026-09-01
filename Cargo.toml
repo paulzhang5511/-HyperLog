@@ -27,6 +27,9 @@ env_logger = "0.11"
 # Error handling
 thiserror = "1.0"
 
+# 时间格式化：导出默认文件名需要本地日历时间戳（spec T17）
+chrono = "0.4"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

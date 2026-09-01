@@ -3,3 +3,6 @@
 pub mod export;
 pub mod indexer;
 pub mod search;
+
+/// 跨模块共享的可中断令牌（检索与导出复用同一实现，见 `search::CancelToken`）。
+pub use search::CancelToken;

@@ -55,10 +55,27 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     state.pending_search = true;
                 }
 
-                // 有结果时可切换「命中视图」
+                // 有结果时的命中视图切换与导出（T15：检索中仅禁用 打开/搜索/导出）
                 if !state.search_results.is_empty() {
                     ui.separator();
                     ui.toggle_value(&mut state.in_result_mode, "显示命中");
+
+                    if state.is_exporting {
+                        if ui.button("取消导出").clicked() {
+                            state.pending_export_cancel = true;
+                        }
+                    } else {
+                        let can_export = !state.is_searching;
+                        if ui
+                            .add_enabled(can_export, egui::Button::new("导出结果"))
+                            .clicked()
+                        {
+                            state.pending_export = true;
+                        }
+                        if can_export {
+                            ui.toggle_value(&mut state.export_with_prefix, "带文件名前缀");
+                        }
+                    }
                 }
 
                 ui.separator();
