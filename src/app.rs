@@ -12,6 +12,8 @@ pub struct AppState {
     pub status_text: String,
     /// 已加载的日志文件集合（支持多文件全局行寻址）。
     pub fileset: FileSet,
+    /// 着色器：级别高亮（检索时复用同一 `Regex` 做命中高亮）。
+    pub highlighter: crate::highlight::Highlighter,
     /// 是否启用折行显示（默认关闭，横向滚动；见 spec G7）。
     pub wrap: bool,
     /// toolbar 置位后，在 `ui` 中弹出打开文件对话框。
