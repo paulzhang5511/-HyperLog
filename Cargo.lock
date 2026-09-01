@@ -1599,6 +1599,7 @@ dependencies = [
  "rayon",
  "regex",
  "rfd",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
