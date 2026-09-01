@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
+use rayon::prelude::*;
 use regex::bytes::Regex as BytesRegex;
 use regex::{Regex, RegexBuilder};
 
@@ -143,6 +144,38 @@ fn search_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// 对单个字节块做检索：整块 `find_iter` 后将命中偏移二分映射回行号。
+///
+/// 块内去重（同一行多次命中只记一次，与「逐行」原语义一致）；跨行匹配忽略。
+/// 各块字节区间互不重叠且边界对齐到行，故跨块无需去重（M7 波次并行的基础）。
+fn scan_chunk(
+    re: &BytesRegex,
+    file: &LogFileIndex,
+    byte_lo: usize,
+    slice: &[u8],
+    file_idx: usize,
+) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    let mut last_li: Option<usize> = None;
+    for m in re.find_iter(slice) {
+        let s = m.start();
+        let e = m.end();
+        // 跨行匹配按「逐行」原语义忽略（正常匹配不含换行，块边界即行边界）。
+        if slice[s..e].contains(&b'\n') {
+            continue;
+        }
+        let li = file.line_index_of_byte(byte_lo + s);
+        if last_li != Some(li) {
+            last_li = Some(li);
+            hits.push(SearchHit {
+                file_idx: file_idx as u32,
+                line_idx: li as u32,
+            });
+        }
+    }
+    hits
+}
+
 /// 在 `files` 上执行检索，结果经 `tx` 流式回传。
 ///
 /// 调用方负责在后台线程中运行本函数，并在启动新检索前保证上一检索已结束
@@ -164,55 +197,56 @@ pub fn run_search(
     };
 
     let total_bytes: u64 = files.iter().map(|f| f.byte_len() as u64).sum();
+    // 预生成全量分块列表（行对齐、互不重叠）：(file_idx, byte_lo, byte_hi)。
+    // 一次构建便于后续按波次并行扫描（M7：P8 余量加固，跨块无重复故无需去重）。
+    let mut chunk_list: Vec<(usize, usize, usize)> = Vec::new();
+    for (file_idx, file) in files.iter().enumerate() {
+        let n = file.line_count();
+        if n == 0 {
+            continue;
+        }
+        for (lo, hi) in file.chunk_bounds(CHUNK_BYTES) {
+            let (bl, bh) = file.byte_range(lo, hi);
+            chunk_list.push((file_idx, bl, bh));
+        }
+    }
+
+    // 每波处理「线程数」个分块：并行度足够，且取消检查在波次之间（< 500 ms，G1）。
+    let ncpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let pool_threads = (ncpus.saturating_sub(1)).max(1);
+    let wave_size = pool_threads.max(1);
+
     let mut bytes_done: u64 = 0;
     let mut total_hits: usize = 0;
     let mut pending: Vec<SearchHit> = Vec::new();
     let mut last_send = Instant::now();
     let pool = search_pool();
 
-    for (file_idx, file) in files.iter().enumerate() {
-        let n = file.line_count();
-        if n == 0 {
-            continue;
+    for wave in chunk_list.chunks(wave_size) {
+        if cancel.is_cancelled() {
+            let _ = tx.send(SearchMessage::Cancelled);
+            return;
         }
-        // 按字节切块（边界对齐到行），逐块做整体 SIMD 检索。块间检查取消，保证 < 500 ms 响应。
-        for (lo, hi) in file.chunk_bounds(CHUNK_BYTES) {
-            if cancel.is_cancelled() {
-                let _ = tx.send(SearchMessage::Cancelled);
-                return;
+        // 波内分块并行扫描：各块字节区间互不重叠，命中行无重复。
+        let results: Vec<Vec<SearchHit>> = pool.install(|| {
+            wave.par_iter()
+                .map(|&(file_idx, bl, bh)| {
+                    let file = &files[file_idx];
+                    let slice = &file.raw_bytes()[bl..bh];
+                    scan_chunk(&re, file, bl, slice, file_idx)
+                })
+                .collect()
+        });
+
+        for (i, hits) in results.into_iter().enumerate() {
+            bytes_done += (wave[i].2 - wave[i].1) as u64;
+            let chunk_len = hits.len();
+            if chunk_len > 0 {
+                pending.extend(hits);
+                total_hits += chunk_len;
             }
-
-            // 块内整体做字节级 SIMD 检索（一次扫描替代逐行 dispatch，M6 P8 优化）：
-            // 对整块字节 `find_iter`，再把命中偏移映射回行号；跨行匹配按「逐行」原语义忽略。
-            let (byte_lo, byte_hi) = file.byte_range(lo, hi);
-            let slice = &file.raw_bytes()[byte_lo..byte_hi];
-            let chunk_hits: Vec<SearchHit> = pool.install(|| {
-                let mut hits: Vec<SearchHit> = Vec::new();
-                let mut last_li: Option<usize> = None;
-                for m in re.find_iter(slice) {
-                    let s = m.start();
-                    let e = m.end();
-                    // 跨行匹配按「逐行」原语义忽略（正常匹配不含换行，块边界即行边界）。
-                    if slice[s..e].contains(&b'\n') {
-                        continue;
-                    }
-                    let li = file.line_index_of_byte(byte_lo + s);
-                    if last_li != Some(li) {
-                        last_li = Some(li);
-                        hits.push(SearchHit {
-                            file_idx: file_idx as u32,
-                            line_idx: li as u32,
-                        });
-                    }
-                }
-                hits
-            });
-
-            let chunk_len = chunk_hits.len();
-            pending.extend(chunk_hits);
-            total_hits += chunk_len;
-            bytes_done += file.byte_span(lo, hi); // 精确块字节跨度，跨文件累计
-
             if total_hits >= options.max_hits {
                 pending.truncate(options.max_hits);
                 let batch = std::mem::take(&mut pending);
@@ -226,16 +260,16 @@ pub fn run_search(
                 });
                 return;
             }
+        }
 
-            if last_send.elapsed() >= SEND_INTERVAL && !pending.is_empty() {
-                let batch = std::mem::take(&mut pending);
-                let _ = tx.send(SearchMessage::Partial {
-                    hits: batch,
-                    bytes_done,
-                    bytes_total: total_bytes,
-                });
-                last_send = Instant::now();
-            }
+        if last_send.elapsed() >= SEND_INTERVAL && !pending.is_empty() {
+            let batch = std::mem::take(&mut pending);
+            let _ = tx.send(SearchMessage::Partial {
+                hits: batch,
+                bytes_done,
+                bytes_total: total_bytes,
+            });
+            last_send = Instant::now();
         }
     }
 

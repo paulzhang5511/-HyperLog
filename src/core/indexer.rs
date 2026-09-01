@@ -183,20 +183,6 @@ impl LogFileIndex {
         self.line_offsets.get(line_idx).copied()
     }
 
-    /// 行区间 `[lo, hi)` 覆盖的字节长度（含最后一行到其行尾的内容）。
-    pub fn byte_span(&self, lo: usize, hi: usize) -> u64 {
-        let start = self.line_offsets.get(lo).copied().unwrap_or(0);
-        let end = if hi < self.line_count() {
-            self.line_offsets
-                .get(hi)
-                .copied()
-                .unwrap_or(self.mmap.len())
-        } else {
-            self.mmap.len()
-        };
-        (end - start) as u64
-    }
-
     /// 整段 mmap 原始字节（含 BOM），供检索做字节级 SIMD 匹配，不触发 UTF-8 校验。
     #[inline]
     pub fn raw_bytes(&self) -> &[u8] {
