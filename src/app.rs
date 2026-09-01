@@ -73,6 +73,15 @@ pub struct AppState {
     pub pending_export: bool,
     /// toolbar 置位后，在 `ui` 中取消导出。
     pub pending_export_cancel: bool,
+
+    // —— 性能 HUD（M9，spec P4/P5/P6 现场观测）——
+    /// 是否显示性能 HUD（帧耗时 / FPS / p95），用于 spec P4/P5/P6 观测。
+    /// 默认由环境变量 `HYPER_LOG_PERF=1` 开启，也可在工具栏「性能」按钮切换。
+    pub show_perf: bool,
+    /// 最近若干帧的帧耗时（毫秒），环形缓冲，用于 p95 / 峰值统计。
+    frame_ms: Vec<f32>,
+    /// 上一帧时间戳（秒，取自 `ctx.input().time`），用于计算帧间隔。
+    last_frame_sec: f64,
 }
 
 pub struct LogViewerApp {
@@ -91,10 +100,16 @@ pub struct LogViewerApp {
 impl LogViewerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         log::info!("Hyper Log starting up");
+        let show_perf = std::env::var("HYPER_LOG_PERF")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let (search_tx, search_rx) = crossbeam_channel::unbounded();
         let (export_tx, export_rx) = crossbeam_channel::unbounded();
         Self {
-            state: AppState::default(),
+            state: AppState {
+                show_perf,
+                ..Default::default()
+            },
             search_tx,
             search_rx,
             search_cancel: None,
@@ -328,6 +343,19 @@ fn error_text(e: &SearchError) -> String {
 impl eframe::App for LogViewerApp {
     /// 每帧 UI 绘制前调用；后台消息轮询放这里（不绘制 UI，窗口隐藏时也推进）。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 性能 HUD：累计帧耗时（仅在有帧处理时更新；空闲时不重绘 → HUD 冻结，正是 P12 期望的空闲行为）。
+        let now = ctx.input(|i| i.time);
+        if self.state.last_frame_sec > 0.0 {
+            let dt = (now - self.state.last_frame_sec) as f32 * 1000.0;
+            if (0.0..=1000.0).contains(&dt) {
+                self.state.frame_ms.push(dt);
+                if self.state.frame_ms.len() > 120 {
+                    self.state.frame_ms.remove(0);
+                }
+            }
+        }
+        self.state.last_frame_sec = now;
+
         let mut n = 0;
         while n < MAX_MSG_PER_FRAME {
             match self.search_rx.try_recv() {
@@ -396,5 +424,38 @@ impl eframe::App for LogViewerApp {
         egui::CentralPanel::default().show(ui, |ui| {
             log_view::show(ui, &self.state);
         });
+
+        // 性能 HUD（spec P4/P5/P6 可观测化）：仅在开启时绘制，且不主动请求重绘，
+        // 避免拉高空闲 CPU（P12）。窗口内容仅在产生新帧时（滚动/检索）刷新。
+        if self.state.show_perf {
+            egui::Window::new("性能 (P4/P5/P6)")
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+                .resizable(false)
+                .collapsible(true)
+                .show(ui.ctx(), |ui| {
+                    let ms = &self.state.frame_ms;
+                    if ms.is_empty() {
+                        ui.label("等待帧数据…（滚动或检索时更新）");
+                        return;
+                    }
+                    let last = *ms.last().unwrap();
+                    let avg = ms.iter().sum::<f32>() / ms.len() as f32;
+                    let mut sorted = ms.clone();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let p95_idx = ((sorted.len() as f32 * 0.95) as usize).min(sorted.len() - 1);
+                    let p95 = sorted[p95_idx];
+                    let peak = *sorted.last().unwrap();
+                    let fps = 1000.0 / avg.max(0.01);
+                    ui.label(format!("FPS ≈ {fps:.0}"));
+                    ui.label(format!("帧耗时  last {last:.1}ms / avg {avg:.1}ms"));
+                    ui.label(format!("p95 {p95:.1}ms / 峰值 {peak:.1}ms"));
+                    ui.label(format!(
+                        "P4 (p95<16.6ms): {}",
+                        if p95 < 16.6 { "✅" } else { "⚠️" }
+                    ));
+                    ui.label("P5: 虚拟滚动，节点数≈视口行+10（代码审查）");
+                    ui.label("P6: 检索峰值帧见「峰值」行应 < 50ms");
+                });
+        }
     }
 }

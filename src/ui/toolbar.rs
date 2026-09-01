@@ -88,6 +88,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 };
                 ui.toggle_value(&mut state.wrap, wrap_label);
 
+                ui.separator();
+
+                // 性能 HUD 开关（spec P4/P5/P6 现场观测；也可经 HYPER_LOG_PERF=1 默认开启）
+                ui.toggle_value(&mut state.show_perf, "性能");
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let count = state.fileset.file_count();
                     if count > 0 {

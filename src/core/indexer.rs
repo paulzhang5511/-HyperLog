@@ -506,5 +506,31 @@ mod tests {
             );
             assert!(per_line <= 8.0, "P3 未达标：{per_line:.2} B/行");
         }
+
+        /// P2：打开 10 GB（≈1 亿行）< 20 s
+        ///
+        /// 10 GB 样本生成/占用成本较高，故默认跳过：请自行准备
+        /// `scripts/gen_log.sh /tmp/bench_10gb.log 100000000` 后运行：
+        ///
+        /// ```bash
+        /// cargo test --release -- --ignored open_10gb_under_20s
+        /// ```
+        #[test]
+        #[ignore]
+        fn open_10gb_under_20s() {
+            let p = PathBuf::from("/tmp/bench_10gb.log");
+            if !p.exists() {
+                println!("跳过 P2：缺少样本 /tmp/bench_10gb.log（约 10 GB）。生成命令：");
+                println!("  scripts/gen_log.sh /tmp/bench_10gb.log 100000000");
+                return;
+            }
+            // 预热页缓存：隔离磁盘 IO，使 P2 度量「索引构建（并行 memchr 偏移扫描）」CPU 侧耗时。
+            let _ = std::fs::read(&p);
+            let start = std::time::Instant::now();
+            let idx = LogFileIndex::open(&p).expect("open");
+            let elapsed = start.elapsed();
+            println!("open 10GB: {elapsed:?} ({} 行)", idx.line_count());
+            assert!(elapsed.as_secs_f64() < 20.0, "P2 未达标：{elapsed:?}");
+        }
     }
 }

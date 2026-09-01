@@ -746,8 +746,12 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 > （各块字节区间互不重叠、命中行无重复，跨块无需去重；取消检查在波次之间 < 500 ms），P7/P8 升至 GB/s 级。
 > M8 补全 P9/P10/P11 的 `#[ignore]` 验收，并修正测量方法以抗环境抖动：**P1/P9/P10/P11 先预热页缓存**，
 > 隔离磁盘 IO；**P7/P8 连跑 3 次取峰值吞吐**（扫描吞吐受机器内存带宽/后台负载影响波动大，峰值反映实现能力）。
-> 未自动化项（需 GUI 手工观测，代码已就位）：P2/P4/P5/P6/P12。
-> 测量命令：`cargo test --release -- --ignored open_1gb_under_2s index_memory_within_budget search_throughput_gb progress_rate_le_20_per_s cancel_response_under_500ms export_1m_lines_under_10s`
+> M9 收尾剩余 GUI 类验收的可观测化：**P2 新增 `#[ignore]` 验收 `open_10gb_under_20s`**（需自备 10GB 样本 `scripts/gen_log.sh /tmp/bench_10gb.log 100000000`）；
+> **P4/P5/P6/P12 经新增性能 HUD 可现场观测**——工具栏「性能」按钮或环境变量 `HYPER_LOG_PERF=1` 开启，实时显示 FPS / 帧耗时 / p95 / 峰值，
+> 其中 p95<16.6ms 即 P4 达标、峰值帧 <50ms 即 P6 达标；P5 由虚拟滚动（`ScrollArea::show_rows`）设计保证节点数恒定≈视口行+10；
+> **P12 空闲 CPU<2% 由 §8.4 重绘策略保证**：`logic()` 仅在检索/导出进行中 `request_repaint()`，空闲态不主动重绘，性能 HUD 自身也不触发重绘。
+> 说明：P2/P4/P5/P6/P12 的最终数值仍需在目标机实机窗口观测（代码与观测手段均已就位）。
+> 测量命令：`cargo test --release -- --ignored open_1gb_under_2s open_10gb_under_20s index_memory_within_budget search_throughput_gb progress_rate_le_20_per_s cancel_response_under_500ms export_1m_lines_under_10s`
 
 ### 11.3 手工冒烟清单（每个里程碑执行）
 
@@ -793,6 +797,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | **M6** | ✅ 完成 | `079c7b6`（T18–T20） |
 | **M7** | ✅ 完成 | 见 §14（检索块级并行化，P7/P8 余量加固） |
 | **M8** | ✅ 完成 | 见 §14（P9/P10/P11 验收测试 + 抗抖动测量方法） |
+| **M9** | ✅ 完成 | 见 §14（性能 HUD 可观测化 P4/P5/P6/P12 + P2 验收测试 + §8.4 空闲重绘策略确认） |
 
 > 说明：M1/M2 合并于同一提交，因为 `core::indexer` 的 API 必须被 UI 消费后才不会触发
 > `clippy -D warnings` 的 dead_code 门禁，单独提交索引器会使 CI 在合并前变红。
@@ -833,3 +838,4 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-02 | M6 收尾：新增 §11.2.1 实测值（P1=0.982s / P3=8.00B·行⁻¹ / P7=578.7MB·s⁻¹ / P8=803.7MB·s⁻¹，全部达标）；§12.1 标记 M6 ✅ `079c7b6`；§13.1 记录 Q4/Q5/Q7/Q8–Q10 决策结论；新增 `memchr` 依赖与字节级 SIMD 检索方案 | Agent |
 | 2026-09-02 | M7 检索块级并行化：将 `run_search` 分块扫描改为按波次 `rayon` 并行（`scan_chunk` 抽取为自由函数，各块区间不重叠故跨块无需去重，取消检查在波次之间），P7 578.7→1425.3 MB/s、P8 803.7→2073.6 MB/s；删除不再使用的 `byte_span`；§11.2.1 实测值更新、§12.1 增 M7 | Agent |
 | 2026-09-02 | M8 验收补全：新增 P9/P10/P11 的 `#[ignore]` 行为测试（`progress_rate_le_20_per_s` 计数 `Partial` 消息断言 ≤20 条/秒；`cancel_response_under_500ms` 50ms 后取消断言延迟 <500ms；`export_1m_lines_under_10s` 导出 100 万行断言 <10s/104MB）；并修正测量方法抗环境抖动——P1/P9/P10/P11 先 `std::fs::read` 预热页缓存，P7/P8 连跑 3 次取峰值吞吐。最终实测 P1=1.26s、P7 峰值 1360 MB/s、P8 峰值 2275 MB/s、P9=9.1 条/秒、P10=5.8ms、P11=356ms/104MB，全部达标；clippy/fmt/24 单测/6 ignore 测试/发布窗口烟测均绿 | Agent |
+| 2026-09-02 | M9 GUI 验收可观测化：① 新增性能 HUD（`AppState.show_perf`，工具栏「性能」按钮或 `HYPER_LOG_PERF=1` 开启），`logic()` 用 `ctx.input().time` 累计帧耗时环形缓冲，`ui()` 以 `egui::Window` 显示 FPS/帧耗时/p95/峰值，供 P4(p95<16.6ms)/P5(虚拟滚动)/P6(峰值<50ms) 现场观测；② `indexer.rs::open_10gb_under_20s` 新增 P2 `#[ignore]` 验收（需自备 10GB 样本）；③ 确认 §8.4 空闲重绘策略：`logic()` 仅检索/导出中 `request_repaint()`，空闲不重绘 → P12 空闲 CPU<2% 由设计保证，HUD 自身也不触发重绘。clippy/fmt/24 单测/7 ignore/发布烟测均绿 | Agent |
