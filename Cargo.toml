@@ -1,0 +1,32 @@
+[package]
+name = "hyper-log"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# GUI framework
+egui = "0.36.1"
+# 同时启用 glow 与 wgpu：默认用 glow（OpenGL，兼容性最好），
+# wgpu 在部分 macOS 机型上会因 Metal 着色器编译失败而无法启动，
+# 可通过环境变量 HYPER_LOG_RENDERER=wgpu 显式切换。
+eframe = { version = "0.36.1", features = ["default", "glow"] }
+
+# High-performance I/O and concurrent computation
+memmap2 = "0.9"
+rayon = "1.10"
+regex = "1.10"
+crossbeam-channel = "0.5.16"
+
+# Filesystem and dialog interaction
+rfd = "0.15"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

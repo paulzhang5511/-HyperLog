@@ -1,0 +1,13 @@
+/target
+
+# 工作台数据（记忆、会话状态），不入库
+/.workbuddy/
+
+# 本地生成的大样本日志（scripts/gen_log.sh 产出目录）
+/tmp/
+/bench/
+
+# 导出过程中的临时文件
+*.log.tmp
+
+.DS_Store
