@@ -293,3 +293,71 @@ mod tests {
         let _ = std::fs::remove_file(&dest);
     }
 }
+
+#[cfg(test)]
+mod perf {
+    use super::*;
+
+    use crate::core::indexer::LogFileIndex;
+
+    const BENCH_1GB: &str = "/tmp/bench_1gb.log";
+
+    fn require_sample() -> PathBuf {
+        let p = PathBuf::from(BENCH_1GB);
+        assert!(
+            p.exists(),
+            "缺少性能样本 {BENCH_1GB}；请先运行：scripts/gen_log.sh {BENCH_1GB} 10000000"
+        );
+        p
+    }
+
+    /// P11：导出 100 万行结果 < 10 s（spec §11.2 P11）。
+    /// 峰值内存增量 < 100 MB 需外部观测（如 `/usr/bin/time -l`），本用例仅断言耗时。
+    #[test]
+    #[ignore]
+    fn export_1m_lines_under_10s() {
+        let p = require_sample();
+        let _ = std::fs::read(&p); // 预热页缓存
+        let idx = Arc::new(LogFileIndex::open(&p).expect("open"));
+        let total = idx.line_count();
+        assert!(total >= 1_000_000, "样本行数不足 100 万：{total}");
+        let mut fs = FileSet::new();
+        fs.push(idx.clone());
+
+        // 取前 100 万行作为命中集（file_idx = 0）。
+        let n_export = 1_000_000usize;
+        let hits: Vec<SearchHit> = (0..n_export as u32)
+            .map(|li| SearchHit {
+                file_idx: 0,
+                line_idx: li,
+            })
+            .collect();
+
+        let dest = std::env::temp_dir().join("hl_export_perf_1m.log");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let start = Instant::now();
+        export_async(
+            Arc::new(fs),
+            Arc::new(hits),
+            dest.clone(),
+            ExportFormat::RawLines,
+            CancelToken::new(),
+            tx,
+        );
+        let elapsed = start.elapsed();
+
+        let mut bytes = 0u64;
+        let mut completed = false;
+        while let Ok(m) = rx.try_recv() {
+            if let ExportMessage::Completed { bytes: b, .. } = m {
+                bytes = b;
+                completed = true;
+            }
+        }
+        assert!(completed, "导出应以 Completed 结束");
+        println!("导出 100 万行: {elapsed:?}, {bytes} 字节");
+        assert!(elapsed.as_secs_f64() < 10.0, "P11 未达标：{elapsed:?}");
+
+        let _ = std::fs::remove_file(&dest);
+    }
+}

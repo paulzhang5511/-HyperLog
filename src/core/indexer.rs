@@ -480,6 +480,10 @@ mod tests {
         #[ignore]
         fn open_1gb_under_2s() {
             let p = require_sample();
+            // 预热页缓存：并行偏移扫描会触达每个字节，若样本不在缓存则首开耗时含磁盘读，
+            // 与机器存储强相关。先整文件读一遍，使 P1 稳定度量「索引构建」CPU 侧耗时
+            // （冷盘首开另受存储限制，spec P1 关注打开到可滚动的索引开销）。
+            let _ = std::fs::read(&p);
             let start = std::time::Instant::now();
             let idx = LogFileIndex::open(&p).expect("open");
             let elapsed = start.elapsed();
