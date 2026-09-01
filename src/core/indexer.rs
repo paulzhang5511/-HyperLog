@@ -150,6 +150,59 @@ impl LogFileIndex {
     pub fn index_memory_bytes(&self) -> usize {
         self.line_offsets.len() * 8
     }
+
+    /// 生成行索引分块 `[lo, hi)`，每块字节量约 `target_bytes`，块边界对齐到行起点。
+    ///
+    /// 返回的是「行号区间」而非字节区间：每个区间内的行可被独立并行扫描，
+    /// 因为块边界恰好落在某行的 `line_offsets` 起点上，不会切断行（修复 D5）。
+    pub fn chunk_bounds(&self, target_bytes: usize) -> Vec<(usize, usize)> {
+        let n = self.line_count();
+        if n == 0 {
+            return Vec::new();
+        }
+        let target = target_bytes.max(1);
+        let mut out = Vec::new();
+        let mut lo = 0usize;
+        let mut acc = 0usize;
+        for i in 1..=n {
+            let end = if i < n {
+                self.line_offsets[i]
+            } else {
+                self.mmap.len()
+            };
+            acc += end - self.line_offsets[lo];
+            if acc >= target || i == n {
+                out.push((lo, i));
+                lo = i;
+                acc = 0;
+            }
+        }
+        if lo < n {
+            out.push((lo, n));
+        }
+        out
+    }
+
+    /// 第 `line_idx` 行在 mmap 中的起始字节偏移（绝对偏移，已含 BOM 跳过）。
+    // M5 导出流式写行时按字节偏移直读 mmap，本里程碑 UI 暂不消费。
+    #[allow(dead_code)]
+    pub fn line_start(&self, line_idx: usize) -> Option<usize> {
+        self.line_offsets.get(line_idx).copied()
+    }
+
+    /// 行区间 `[lo, hi)` 覆盖的字节长度（含最后一行到其行尾的内容）。
+    pub fn byte_span(&self, lo: usize, hi: usize) -> u64 {
+        let start = self.line_offsets.get(lo).copied().unwrap_or(0);
+        let end = if hi < self.line_count() {
+            self.line_offsets
+                .get(hi)
+                .copied()
+                .unwrap_or(self.mmap.len())
+        } else {
+            self.mmap.len()
+        };
+        (end - start) as u64
+    }
 }
 
 impl FileSet {
@@ -176,6 +229,11 @@ impl FileSet {
     /// 按索引取文件（只读引用），越界返回 `None`。
     pub fn file(&self, idx: usize) -> Option<&Arc<LogFileIndex>> {
         self.files.get(idx)
+    }
+
+    /// 已加载文件列表（只读），供检索引擎快照扫描（spec §7.3 / M4）。
+    pub fn files(&self) -> &[Arc<LogFileIndex>] {
+        &self.files
     }
 
     /// 全局总行数。

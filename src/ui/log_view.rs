@@ -11,7 +11,13 @@ const ROW_HEIGHT: f32 = 16.0;
 const MAX_RENDER_CHARS: usize = 100_000;
 
 pub fn show(ui: &mut egui::Ui, state: &AppState) {
-    let total = state.fileset.total_lines();
+    let in_result = state.in_result_mode && !state.search_results.is_empty();
+    let total = if in_result {
+        state.search_results.len()
+    } else {
+        state.fileset.total_lines()
+    };
+
     if total == 0 {
         ui.centered_and_justified(|ui| {
             ui.label("尚未打开任何日志文件（点击左上角「打开」）");
@@ -24,7 +30,16 @@ pub fn show(ui: &mut egui::Ui, state: &AppState) {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
     }
 
-    let hl = &state.highlighter;
+    // 结果视图下，若已编译命中正则则复用同一 `Regex` 做命中高亮（G5）。
+    let hl = if in_result {
+        state
+            .hit_regex
+            .as_ref()
+            .map(|r| state.highlighter.clone().with_hit(r.clone()))
+            .unwrap_or_else(|| state.highlighter.clone())
+    } else {
+        state.highlighter.clone()
+    };
 
     egui::ScrollArea::both().auto_shrink([false; 2]).show_rows(
         ui,
@@ -32,22 +47,30 @@ pub fn show(ui: &mut egui::Ui, state: &AppState) {
         total,
         |ui, range| {
             for row in range {
-                let line: Cow<'_, str> = state.fileset.line(row).unwrap_or_default();
+                // 结果视图：row 是命中索引；全量视图：row 是全局行号
+                let (line, gutter) = if in_result {
+                    let hit = state.search_results[row];
+                    let line = state
+                        .fileset
+                        .file(hit.file_idx as usize)
+                        .and_then(|f| f.line(hit.line_idx as usize))
+                        .unwrap_or_default();
+                    (line, format!("{}.{}", hit.file_idx + 1, hit.line_idx + 1))
+                } else {
+                    let line = state.fileset.line(row).unwrap_or_default();
+                    (line, format!("{:>6}", row + 1))
+                };
+
                 let text = truncate_for_render(&line);
 
                 ui.horizontal(|ui| {
-                    // 行号列：等宽、右对齐、弱化显示
                     ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!("{:>6}", row + 1))
-                                .monospace()
-                                .weak(),
-                        )
-                        .selectable(false),
+                        egui::Label::new(egui::RichText::new(gutter).monospace().weak())
+                            .selectable(false),
                     );
                     ui.separator();
-                    // 仅对可视区约 60 行做着色（spec A8），复用已编译的 level_re
-                    render_line(ui, &text, hl);
+                    // 仅对可视区约 60 行做着色（spec A8），复用已编译正则
+                    render_line(ui, &text, &hl);
                 });
             }
         },

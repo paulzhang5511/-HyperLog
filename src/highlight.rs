@@ -21,6 +21,7 @@ pub enum Level {
 const LEVEL_PATTERN: &str = r"(?-u)\b(FATAL|ERROR|WARNING|WARN|VERBOSE|TRACE|DEBUG|INFO|E|W|I|D)\b";
 
 /// 着色器：持有一组预编译正则，对每行输出分段列表。
+#[derive(Clone)]
 pub struct Highlighter {
     level_re: Regex,
     /// 检索命中正则，仅在进行检索时为 `Some`（与检索复用同一 `Regex`，修复 G5）。
@@ -42,10 +43,8 @@ impl Highlighter {
         }
     }
 
-    /// 额外绑定一个检索命中正则（与 `core::search` 编译出的 `Regex` 复用）。
-    ///
-    /// 供 M4 检索结果高亮使用（见 spec §7.6），M3 阶段尚未接入搜索流。
-    #[allow(dead_code)]
+    /// 额外绑定一个检索命中正则（与 `core::search` 编译出的 `Regex` 复用），
+    /// 用于检索结果命中高亮（spec §7.6，修复 G5）。
     pub fn with_hit(mut self, hit_re: Regex) -> Self {
         self.hit_re = Some(hit_re);
         self
