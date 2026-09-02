@@ -499,6 +499,13 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
   来自 `core::indexer.rs` 的 `cumulative` 累加表）写入 `state.scroll_target` 与
   `state.selected_row`，由 `log_view` 滚动并高亮；同时写入 `state.sidebar_active_file`
   **持久高亮该文件**（类似 VSCode 高亮已打开文件），不受 `scroll_target` 被 `log_view` 消费清零的影响。
+- **反查高亮**：用户在日志区选中某行（`state.selected_row`）时，侧边栏据此自动高亮其所属文件
+  （`FileSet::file_for_global_row(row)` 经 `cumulative` 二分反查），类似 VSCode 高亮光标所在文件；
+  点击文件与点击日志行两者最终都收敛到同一文件，状态一致。
+- **右键菜单**（`Response::context_menu`）：文件行支持「复制路径」（`ctx.copy_text`）、「在文件管理器中显示」
+  （`reveal_in_file_manager`：macOS `open -R` / Windows `explorer /select` / Linux `xdg-open` 父目录）、「跳到该文件」；
+  根节点支持「复制根目录路径」「在文件管理器中显示根目录」。菜单内用 `ui.close()` 关闭（egui 0.36 无 `close_menu`）。
+- **空目录折叠**：目录只作为文件的「中间节点」被创建，不会凭空出现空目录，天然满足空目录折叠。
 
 ### 7.7.5 行号跳转（⌘L）
 
@@ -927,3 +934,4 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-02 | M13 打开目录 + 查找全部 + 独立结果页：① 新增 `core::dirscan.rs`——递归收集目录树下 `.log/.txt/.out`（大小写不敏感），跳过隐藏条目与符号链接，按路径升序确定性返回；工具栏「打开目录」复用 `load_paths` 批量加载。② 新增 `core::grepdir.rs`——对目录逐文件建索引并做字节级检索（复用 `build_regex_bytes` + 分块 `find_iter`），流式回传 `GrepHit`（内联行文本 + 相对路径，因目录索引是临时的），复用 `CancelToken` 与 G6 截断语义。③ 新增 `ui/results_view.rs` 独立结果页（命中总数 + 保存/复制全部/返回日志 + 虚拟滚动列表「路径:行号 内容」），「保存结果」把命中按「路径:行号: 内容」写盘。④ AppState/app.rs 接线目录检索通道与结果页切换；工具栏「打开目录」「查找全部」「停止查找全部」。§7.7 增 7.7.1/7.7.2/7.7.3，新增 8 个单测（48 总），门禁全绿 | Agent |
 | 2026-09-03 | M14 五大体验增强（spec §7.7）：① **常用快捷键**——`app.rs::handle_shortcuts`（固有 impl，非 trait 方法）用 `consume_shortcut` 处理 ⌘O/⌘⇧O/⌘F/⌘L/⌘B/⌘G/⌘↵/Esc，焦点请求经 `toolbar` 下一帧 `request_focus(search_input_id()/line_jump_input_id())` 落实。② **侧边栏目录树**——新增 `ui/sidebar.rs`，由 `FileSet` 路径建 `BTreeMap` 树（`CollapsingHeader` + `selectable_label`），点击文件写 `state.scroll_target = FileSet::file_global_start(file_idx)`（新增 `core::indexer.rs::file_global_start`）；`app.rs` 用 `egui::Panel::left` 承载（⌘B 或 ☰ 切换）。③ **行号跳转**——工具栏「行:」输入经 `apply_line_jump` 解析 1-based 全局行号，`log_view` 消费 `scroll_target` 用 `ScrollAreaOutput.state.store` 居中滚动（固定行高 18px）。④ **高亮对比度修复**——`Segment::Hit` 改为文字沿用正常 `text` 色、仅叠 `hit_bg` 荧光底色（VS Code 风格），调亮两套 `hit_bg`。⑤ **查找全部停止 bug 修复**——`grepdir::search_one_file` 在分块循环**块间**新增 `cancel.is_cancelled()` 检查（原仅文件间检查，大文件整扫时「停止」无效，违反 G1）。§7.7 增 7.7.4/7.7.5/7.7.6 并补命中高亮说明，§12.1 增 M14。门禁 clippy(-D warnings)/fmt/48 单测/发布烟测均绿 | Agent |
 | 2026-09-03 | M14 侧边栏目录树显示修正（参考 VSCode 资源管理器）：原 `build_tree` 直接用绝对路径逐层建树，把 Unix 根 `/` 当节点，打开单文件显示成 `/ → Users → … → 文件` 这种深而无用的结构。改为：① 计算所有文件父目录的**最长公共前缀目录**作为根（标签取文件夹名，根目录显 `/`），树内只展示相对结构；② 构建时跳过 `RootDir`/`Prefix` 组件避免挂载点/盘符成节点；③ 目录（`CollapsingHeader` + 📁）在前、文件（📄 + 文件名 + 行数）按名（不区分大小写）排序在后，贴近 VSCode「文件夹优先、组内字母序」；④ 缩进改由 `CollapsingHeader` 天然嵌套承担，去掉手动叠加的 `add_space`（修正逐层双重缩进）；⑤ 新增 `AppState::sidebar_active_file`，点击文件后持久高亮（类似 VSCode 高亮已打开文件），不再因 `scroll_target` 被消费清零而丢失选中态。同步 `app.rs`、`ui/sidebar.rs`、`docs/spec.md` §7.7.4。门禁 fmt/clippy(-D warnings)/48 单测/发布烟测均绿 | Agent |
+| 2026-09-03 | M14 侧边栏收尾打磨：① 新增 `FileSet::file_for_global_row(row)`（`cumulative` 升序 + `partition_point` 二分反查全局行→所属文件），侧边栏据此**反查高亮**当前选中行所属文件（VSCode 高亮光标所在文件）；② 文件行与根节点加**右键菜单**（`Response::context_menu`）：复制路径（`ctx.copy_text`）、在文件管理器中显示（`reveal_in_file_manager`，macOS `open -R`/Windows `explorer /select`/Linux `xdg-open`）、跳到该文件；③ 空目录天然不出现（目录仅作文件中间节点）。egui 0.36 坑：`context_menu` 是 `Response` 方法、菜单关闭用 `ui.close()`（无 `close_menu`）、`push_id` 闭包返回 `InnerResponse<InnerResponse<..>>` 需从 horizontal 闭包直接返回 `sel.clicked()` 避免 `.inner.inner` 类型错乱。`indexer.rs` 加 `fileset_global_row_mapping` 单测（49 总）。门禁 fmt/clippy(-D warnings)/49 单测/发布烟测均绿 | Agent |

@@ -5,7 +5,9 @@
 //! - 以所有文件父目录的**最长公共前缀**为根（工作区根），只显示相对结构，不显示 `/Users/…` 这种深而无用的绝对路径；
 //! - 目录用 `CollapsingHeader` 折叠（📁 图标），文件用可点击行（📄 图标 + 文件名 + 行数）；
 //! - 目录在前、文件按名排序在后（文件夹优先、组内字母序）；
-//! - 点击文件即跳转到该文件在全局行号空间中的首行（设置 [`AppState::scroll_target`]），并持久高亮（[`AppState::sidebar_active_file`]）。
+//! - 点击文件即跳转到该文件在全局行号空间中的首行（设置 [`AppState::scroll_target`]），并持久高亮（[`AppState::sidebar_active_file`]）；
+//! - **反查高亮**：用户在日志区选中某行（`selected_row`）时，自动高亮其所属文件（VSCode 高亮光标所在文件）；
+//! - **右键菜单**：文件行与根节点支持「复制路径 / 在文件管理器中显示（macOS `open -R`、Windows `explorer /select`、Linux `xdg-open`）/ 跳转」。
 
 use std::path::{Component, Path, PathBuf};
 
@@ -62,6 +64,8 @@ fn root_label(ancestor: &Option<PathBuf>) -> String {
 }
 
 /// 由已加载文件路径构建目录树：先裁剪公共前缀，再按相对路径组件建树（跳过根/`/`组件）。
+///
+/// 目录只作为文件的「中间节点」被创建，因此不会凭空出现空目录（空目录折叠天然满足）。
 fn build_tree(paths: &[(PathBuf, usize)], ancestor: &Option<PathBuf>) -> DirNode {
     let mut root = DirNode::default();
     for (path, file_idx) in paths {
@@ -100,6 +104,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 empty_hint(ui, p);
                 return;
             }
+            // 反查高亮：用户在日志区选中某行时，高亮其所属文件（VSCode 高亮光标所在文件）。
+            if let Some(row) = state.selected_row
+                && let Some(f) = state.fileset.file_for_global_row(row)
+            {
+                state.sidebar_active_file = Some(f);
+            }
             let paths: Vec<(PathBuf, usize)> = state
                 .fileset
                 .files()
@@ -121,7 +131,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 .show(ui, |ui| {
                     render_node(ui, state, p, &tree, 0);
                 });
-                resp.header_response.on_hover_text(full);
+                let hdr = resp.header_response.on_hover_text(full.clone());
+                hdr.context_menu(|ui| {
+                    root_context_menu(ui, &ancestor, &full);
+                });
             });
         });
 }
@@ -155,27 +168,98 @@ fn render_node(ui: &mut egui::Ui, state: &mut AppState, p: &Palette, node: &DirN
             .map(|f| f.path.display().to_string())
             .unwrap_or_default();
 
-        let resp = ui.push_id(("file", *file_idx), |ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(CHEVRON_PAD);
-                let resp = ui.selectable_label(selected, format!("📄 {name}"));
-                let resp = resp.on_hover_text(full);
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!("{} 行", crate::util::group_digits(line_count)))
+        // 整行可点击跳转；右键菜单挂在选中行上（`context_menu` 是 `Response` 方法）。
+        // 在 horizontal 闭包内直接返回 `sel.clicked()`，避免 `InnerResponse` 嵌套导致类型错乱。
+        let clicked = ui
+            .push_id(("file", *file_idx), |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(CHEVRON_PAD);
+                    let sel = ui.selectable_label(selected, format!("📄 {name}"));
+                    let clicked = sel.clicked();
+                    let sel = sel.on_hover_text(full.clone());
+                    sel.context_menu(|ui| {
+                        file_context_menu(ui, state, *file_idx, &full);
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} 行",
+                            crate::util::group_digits(line_count)
+                        ))
                         .color(p.text_dim)
                         .small(),
-                );
-                resp
+                    );
+                    clicked
+                })
+                .inner
             })
-        });
-        if resp.inner.inner.clicked()
-            && let Some(start) = state.fileset.file_global_start(*file_idx)
-        {
+            .inner;
+        if clicked && let Some(start) = state.fileset.file_global_start(*file_idx) {
             state.scroll_target = Some(start);
             state.selected_row = Some(start);
             state.sidebar_active_file = Some(*file_idx);
         }
+    }
+}
+
+/// 文件行右键菜单：复制路径 / 在文件管理器中显示 / 跳转。
+fn file_context_menu(ui: &mut egui::Ui, state: &mut AppState, file_idx: usize, full: &str) {
+    if ui.button("复制路径").clicked() {
+        ui.ctx().copy_text(full.to_owned());
+        ui.close();
+    }
+    if ui.button("在文件管理器中显示").clicked() {
+        if let Some(f) = state.fileset.file(file_idx) {
+            reveal_in_file_manager(&f.path);
+        }
+        ui.close();
+    }
+    if ui.button("跳到该文件").clicked() {
+        if let Some(start) = state.fileset.file_global_start(file_idx) {
+            state.scroll_target = Some(start);
+            state.selected_row = Some(start);
+            state.sidebar_active_file = Some(file_idx);
+        }
+        ui.close();
+    }
+}
+
+/// 根节点右键菜单：复制根目录路径 / 在文件管理器中显示根目录。
+fn root_context_menu(ui: &mut egui::Ui, ancestor: &Option<PathBuf>, full: &str) {
+    if ui.button("复制根目录路径").clicked() {
+        ui.ctx().copy_text(full.to_owned());
+        ui.close();
+    }
+    if ui.button("在文件管理器中显示").clicked() {
+        if let Some(a) = ancestor {
+            reveal_in_file_manager(a);
+        }
+        ui.close();
+    }
+}
+
+/// 在系统文件管理器中定位并选中文件（VSCode 右键「Reveal in File Explorer」等价）。
+#[cfg(target_os = "macos")]
+fn reveal_in_file_manager(path: &Path) {
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn();
+}
+
+/// Windows：用资源管理器选中文件。
+#[cfg(target_os = "windows")]
+fn reveal_in_file_manager(path: &Path) {
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+}
+
+/// 其他平台：打开父目录（无「选中」语义）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn reveal_in_file_manager(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
     }
 }
 

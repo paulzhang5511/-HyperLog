@@ -248,6 +248,28 @@ impl FileSet {
         self.cumulative.get(file_idx).copied()
     }
 
+    /// 全局行号（0-based）→ 所属文件索引；供侧边栏「反查高亮当前文件」（spec §7.7 侧边栏）。
+    ///
+    /// 当用户在日志区选中某行（`selected_row`）时，据此把对应文件在目录树中高亮，
+    /// 类似 VSCode 资源管理器高亮光标所在文件。`cumulative` 升序，用 `partition_point` 定位。
+    /// 越界（行号 >= 总行数）返回 `None`。
+    pub fn file_for_global_row(&self, row: usize) -> Option<usize> {
+        if self.files.is_empty() {
+            return None;
+        }
+        // `cumulative[i]` = 文件 i 的起始全局行；`cumulative[i+1]` 为其结束（不含）。
+        // 找最大的 i 使 `cumulative[i] <= row`。
+        let n = self.cumulative.partition_point(|&c| c <= row);
+        if n == 0 {
+            return None;
+        }
+        let idx = n - 1;
+        if idx >= self.files.len() {
+            return None;
+        }
+        Some(idx)
+    }
+
     /// 已加载文件列表（只读），供检索引擎快照扫描（spec §7.3 / M4）。
     pub fn files(&self) -> &[Arc<LogFileIndex>] {
         &self.files
@@ -456,6 +478,30 @@ mod tests {
     fn index_memory_is_eight_bytes_per_line() {
         let idx = LogFileIndex::open(fixture("crlf.log")).unwrap();
         assert_eq!(idx.index_memory_bytes(), idx.line_count() * 8);
+    }
+
+    /// `FileSet` 全局行 ↔ 所属文件的双向映射（侧边栏「反查高亮当前文件」依赖）。
+    #[test]
+    fn fileset_global_row_mapping() {
+        let mut set = FileSet::new();
+        let a = Arc::new(LogFileIndex::open(fixture("no_trailing_newline.log")).unwrap());
+        let b = Arc::new(LogFileIndex::open(fixture("crlf.log")).unwrap());
+        let a_lines = a.line_count();
+        let b_lines = b.line_count();
+        set.push(a);
+        set.push(b);
+
+        // 首行映射：文件 i 的起始全局行 = cumulative[i]
+        assert_eq!(set.file_global_start(0), Some(0));
+        assert_eq!(set.file_global_start(1), Some(a_lines));
+
+        // 反查：文件 0 占 [0, a_lines)，文件 1 占 [a_lines, a_lines+b_lines)
+        assert_eq!(set.file_for_global_row(0), Some(0));
+        assert_eq!(set.file_for_global_row(a_lines - 1), Some(0));
+        assert_eq!(set.file_for_global_row(a_lines), Some(1));
+        assert_eq!(set.file_for_global_row(a_lines + b_lines - 1), Some(1));
+        // 越界（== 总行数）返回 None
+        assert_eq!(set.file_for_global_row(a_lines + b_lines), None);
     }
 
     /// 大文件性能验收（spec §11.2，对应 T19）。
