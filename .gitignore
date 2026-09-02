@@ -1,5 +1,8 @@
 /target
 
+# 打包产物（scripts/package_macos.sh 产出：HyperLog.app / *.zip）
+/dist/
+
 # 工作台数据（记忆、会话状态），不入库
 /.workbuddy/
 
