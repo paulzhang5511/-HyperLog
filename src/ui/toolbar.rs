@@ -17,6 +17,39 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     state.pending_open = true;
                 }
 
+                // 最近文件（M11 / spec Q3）：检索中整体禁用（G1）
+                ui.add_enabled_ui(!state.is_searching, |ui| {
+                    // 先快照条目，避免在菜单闭包内同时持有 recents 的借用与可变引用。
+                    let entries: Vec<std::path::PathBuf> = state.recents.entries().to_vec();
+                    ui.menu_button("最近文件", |ui| {
+                        if entries.is_empty() {
+                            ui.label("（暂无记录）");
+                            return;
+                        }
+                        for p in entries {
+                            // 菜单只显示文件名，完整路径放在悬浮提示里。
+                            let name = p
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| p.display().to_string());
+                            if ui
+                                .button(name)
+                                .on_hover_text(p.display().to_string())
+                                .clicked()
+                            {
+                                state.pending_open_recent = Some(p);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("清除最近文件").clicked() {
+                            state.recents.clear();
+                            state.recents.save();
+                            ui.close();
+                        }
+                    });
+                });
+
                 ui.separator();
 
                 // 检索控件：检索中整体禁用（「停止」按钮保持可用，见下方）

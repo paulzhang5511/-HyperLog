@@ -800,6 +800,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | **M8** | ✅ 完成 | 见 §14（P9/P10/P11 验收测试 + 抗抖动测量方法） |
 | **M9** | ✅ 完成 | 见 §14（性能 HUD 可观测化 P4/P5/P6/P12 + P2 验收测试 + §8.4 空闲重绘策略确认） |
 | **M10** | ✅ 完成 | 见 §14（打包：scripts/package_macos.sh → HyperLog.app + zip，提前交付 G11） |
+| **M11** | ✅ 完成 | 见 §14（Q3 最近文件：src/core/recents.rs 零依赖持久化 + 工具栏「最近文件」菜单） |
 
 > 说明：M1/M2 合并于同一提交，因为 `core::indexer` 的 API 必须被 UI 消费后才不会触发
 > `clippy -D warnings` 的 dead_code 门禁，单独提交索引器会使 CI 在合并前变红。
@@ -812,7 +813,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | --- | --- | --- | --- |
 | Q1 | 是否接受偏离 PRD §3.1 的三文件结构，改为 §6 的模块化拆分？ | **接受**（PRD 结构撑不下进度/取消/高亮） | 目录结构、D13 |
 | Q2 | 目标平台是否包含 Linux？ | MVP **不含**（`rfd`/`wgpu` 需额外验证） | CI matrix |
-| Q3 | 是否需要"最近打开的文件"持久化？ | MVP **不做**（需要引入配置文件依赖，见 §10 Ask First） | 功能范围 |
+| Q3 | 是否需要"最近打开的文件"持久化？ | MVP 不做；**M11 已实现**（`src/core/recents.rs`）——当初的推迟理由是"需引入配置文件依赖"，M11 改用 `std::fs` + 平台配置目录的纯文本持久化，**零新增依赖**，该阻塞点已消解 | 功能范围 |
 | Q4 | 结果上限 2,000,000 是否合适？ | 保持默认，M5 后按实测调 | G6 |
 | Q5 | 导出默认格式用 `RawLines` 还是 `WithPrefix`？ | **默认 `RawLines`**（可直接被其它工具消费），UI 提供勾选 | G8 |
 | Q6 | 是否需要处理"日志文件在打开期间被其它进程 truncate / 删除"？ | MVP **不处理**，在状态栏提示"文件已被修改，请重新加载"需文件监听（P2） | D15 |
@@ -842,4 +843,6 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-02 | M8 验收补全：新增 P9/P10/P11 的 `#[ignore]` 行为测试（`progress_rate_le_20_per_s` 计数 `Partial` 消息断言 ≤20 条/秒；`cancel_response_under_500ms` 50ms 后取消断言延迟 <500ms；`export_1m_lines_under_10s` 导出 100 万行断言 <10s/104MB）；并修正测量方法抗环境抖动——P1/P9/P10/P11 先 `std::fs::read` 预热页缓存，P7/P8 连跑 3 次取峰值吞吐。最终实测 P1=1.26s、P7 峰值 1360 MB/s、P8 峰值 2275 MB/s、P9=9.1 条/秒、P10=5.8ms、P11=356ms/104MB，全部达标；clippy/fmt/24 单测/6 ignore 测试/发布窗口烟测均绿 | Agent |
 | 2026-09-02 | M9 GUI 验收可观测化：① 新增性能 HUD（`AppState.show_perf`，工具栏「性能」按钮或 `HYPER_LOG_PERF=1` 开启），`logic()` 用 `ctx.input().time` 累计帧耗时环形缓冲，`ui()` 以 `egui::Window` 显示 FPS/帧耗时/p95/峰值，供 P4(p95<16.6ms)/P5(虚拟滚动)/P6(峰值<50ms) 现场观测；② `indexer.rs::open_10gb_under_20s` 新增 P2 `#[ignore]` 验收（需自备 10GB 样本）；③ 确认 §8.4 空闲重绘策略：`logic()` 仅检索/导出中 `request_repaint()`，空闲不重绘 → P12 空闲 CPU<2% 由设计保证，HUD 自身也不触发重绘。clippy/fmt/24 单测/7 ignore/发布烟测均绿 | Agent |
 | 2026-09-02 | P2 实测验收闭环：生成 10GB 样本（`scripts/gen_log.sh /tmp/bench_10gb.log 100000000` → 9.7G/1 亿行），运行 `open_10gb_under_20s` 预热页缓存后实测 `open` 耗时 **15.52 s**（< 20s 阈值）→ P2 ✅ 余量充足。§11.2.1 增补 P2 实测行、§14 本行记录 | Agent |
+| 2026-09-02 | M10 收尾修补：`/dist/` 加入 `.gitignore`（打包产物此前会以 `?? dist/` 污染 `git status`）；`scripts/package_macos.sh` 补可执行位（原 644，与同目录其它脚本 755 不一致）。端到端复跑打包脚本通过，产物 `dist/HyperLog.app` 12M / `dist/HyperLog-macos.zip` 5.3M | Agent |
+| 2026-09-02 | M11 最近文件（Q3）：新增 `src/core/recents.rs`——**零新增依赖**（eframe 的 `persistence` 特性需拉入 `serde`+`ron`，正是 Q3 当初推迟的理由，故改用 `std::fs` 纯文本持久化）。按行存储绝对路径、最近优先、上限 10 条；读取时丢弃空行/重复/已失效条目；写入走「临时文件 + `rename`」。存储位置 macOS `~/Library/Application Support/hyper-log/recent_files.txt`、Windows `%APPDATA%\hyper-log\`、其它 `~/.config/hyper-log/`。`app.rs` 把打开逻辑抽为 `load_paths()`，供文件对话框与最近文件共用，仅成功打开才记账；工具栏新增「最近文件」菜单（检索中禁用 G1，含「清除最近文件」）。沿用「追加而非替换」语义（MVP 无关闭单个文件能力）。新增 5 个单测；门禁 clippy/fmt/29 单测全绿 | Agent |
 | 2026-09-02 | M10 提前交付打包（G11）：新增 `scripts/package_macos.sh`，`cargo build --release` 后组装 `dist/HyperLog.app`（Info.plist + 二进制 + ad-hoc 签名），并打包 `dist/HyperLog-macos.zip`（5.3M）；冒烟验证 `.app` 内二进制启动 ALIVE（Glow）。G11 由「P2 待定」改为 M10 ✅；§12.12 增补 `.app` 分发说明；§12.1 增 M10 | Agent |

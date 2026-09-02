@@ -6,6 +6,7 @@ use regex::Regex;
 
 use crate::core::export::{ExportFormat, ExportMessage};
 use crate::core::indexer::{FileSet, IndexError, LogFileIndex};
+use crate::core::recents::Recents;
 use crate::core::search::{
     CancelToken, SearchError, SearchHit, SearchMessage, SearchMode, SearchOptions,
 };
@@ -30,6 +31,10 @@ pub struct AppState {
     pub wrap: bool,
     /// toolbar 置位后，在 `ui` 中弹出打开文件对话框。
     pub pending_open: bool,
+    /// 最近打开的文件列表（M11 / spec Q3），持久化在平台配置目录。
+    pub recents: Recents,
+    /// toolbar 置位后，在 `ui` 中打开该最近文件（避免在同一帧内同时借用 UI 与 self）。
+    pub pending_open_recent: Option<PathBuf>,
 
     // —— 检索相关 ——
     /// 检索关键字。
@@ -108,6 +113,7 @@ impl LogViewerApp {
         Self {
             state: AppState {
                 show_perf,
+                recents: Recents::load(),
                 ..Default::default()
             },
             search_tx,
@@ -134,6 +140,14 @@ impl LogViewerApp {
             return;
         };
 
+        self.load_paths(paths);
+    }
+
+    /// 加载一批路径：文件对话框与「最近文件」共用同一套校验与提示逻辑（M11）。
+    ///
+    /// 成功加载的路径会记入最近文件列表并立即落盘。沿用「打开」的既有语义：
+    /// 新文件是**追加**到当前文件集合，而非替换（MVP 未提供关闭单个文件的能力）。
+    fn load_paths(&mut self, paths: Vec<PathBuf>) {
         let mut loaded = 0usize;
         let mut skipped = 0usize;
         let mut errors: Vec<String> = Vec::new();
@@ -160,6 +174,8 @@ impl LogViewerApp {
             match LogFileIndex::open(&path) {
                 Ok(idx) => {
                     self.state.fileset.push(Arc::new(idx));
+                    // 只有真正成功打开才记入最近文件（M11）。
+                    self.state.recents.push(path.clone());
                     loaded += 1;
                 }
                 Err(IndexError::Empty(_)) => {
@@ -171,6 +187,10 @@ impl LogViewerApp {
                     errors.push(format!("{e}"));
                 }
             }
+        }
+
+        if loaded > 0 {
+            self.state.recents.save();
         }
 
         let total = self.state.fileset.total_lines();
@@ -396,6 +416,12 @@ impl eframe::App for LogViewerApp {
         if self.state.pending_open && !self.state.is_searching {
             self.state.pending_open = false;
             self.open_files();
+        }
+        // 最近文件（M11）：同样在检索中禁用（G1）。
+        if !self.state.is_searching
+            && let Some(path) = self.state.pending_open_recent.take()
+        {
+            self.load_paths(vec![path]);
         }
         if self.state.pending_export {
             self.state.pending_export = false;
