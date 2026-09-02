@@ -5,12 +5,13 @@ use crossbeam_channel::{Receiver, Sender};
 use regex::Regex;
 
 use crate::core::export::{ExportFormat, ExportMessage};
+use crate::core::grepdir::{GrepHit, GrepMessage, GrepOptions};
 use crate::core::indexer::{FileSet, IndexError, LogFileIndex};
 use crate::core::recents::Recents;
 use crate::core::search::{
     CancelToken, SearchError, SearchHit, SearchMessage, SearchMode, SearchOptions,
 };
-use crate::ui::{log_view, status_bar, theme, toolbar};
+use crate::ui::{log_view, results_view, status_bar, theme, toolbar};
 
 /// 每帧最多处理 1000 条后台消息，防止消息洪水饿死渲染（spec §8.4，对应 D6）。
 const MAX_MSG_PER_FRAME: usize = 1000;
@@ -39,6 +40,8 @@ pub struct AppState {
     pub recents: Recents,
     /// toolbar 置位后，在 `ui` 中打开该最近文件（避免在同一帧内同时借用 UI 与 self）。
     pub pending_open_recent: Option<PathBuf>,
+    /// toolbar 置位后，在 `ui` 中弹出「打开目录」对话框（Q「打开目录」）。
+    pub pending_open_dir: bool,
 
     // —— 检索相关 ——
     /// 检索关键字。
@@ -91,6 +94,30 @@ pub struct AppState {
     frame_ms: Vec<f32>,
     /// 上一帧时间戳（秒，取自 `ctx.input().time`），用于计算帧间隔。
     last_frame_sec: f64,
+
+    // —— 目录检索（"查找全部"）相关 ——
+    /// 是否显示独立结果页（`true` 时中央区渲染结果而非日志正文）。
+    pub show_results: bool,
+    /// 目录检索命中结果（内联行文本 + 展示路径）。
+    pub grep_hits: Vec<GrepHit>,
+    /// 结果页当前选中的命中索引。
+    pub grep_selected_row: Option<usize>,
+    /// 目录检索是否因达上限而截断。
+    pub grep_truncated: bool,
+    /// 是否正在目录检索。
+    pub is_grepping: bool,
+    /// 目录检索进度：(已扫描文件数, 总文件数, 已扫描字节)。
+    pub grep_progress: (usize, usize, u64),
+    /// 目录检索失败原因（内联提示）。
+    pub grep_error: Option<String>,
+    /// 当前目录检索的根目录（供展示路径裁剪与「打开目录」回显）。
+    pub grep_root: Option<PathBuf>,
+    /// toolbar 置位后，在 `ui` 中弹出「查找全部」目录选择并启动。
+    pub pending_grep: bool,
+    /// 结果页「保存结果」置位后，在 `ui` 中弹出保存对话框。
+    pub pending_grep_save: bool,
+    /// toolbar 置位后，在 `ui` 中取消目录检索。
+    pub pending_grep_stop: bool,
 }
 
 pub struct LogViewerApp {
@@ -104,6 +131,11 @@ pub struct LogViewerApp {
     export_rx: Receiver<ExportMessage>,
     /// 当前导出的取消令牌；完成后置 `None`。
     export_cancel: Option<CancelToken>,
+    /// 目录检索后台消息通道。
+    grep_tx: Sender<GrepMessage>,
+    grep_rx: Receiver<GrepMessage>,
+    /// 当前目录检索的取消令牌；完成后置 `None`。
+    grep_cancel: Option<CancelToken>,
 }
 
 /// CJK 兜底字体在 `FontDefinitions::font_data` 中的键名。
@@ -149,6 +181,7 @@ impl LogViewerApp {
             .unwrap_or(false);
         let (search_tx, search_rx) = crossbeam_channel::unbounded();
         let (export_tx, export_rx) = crossbeam_channel::unbounded();
+        let (grep_tx, grep_rx) = crossbeam_channel::unbounded();
         Self {
             state: AppState {
                 show_perf,
@@ -161,6 +194,9 @@ impl LogViewerApp {
             export_tx,
             export_rx,
             export_cancel: None,
+            grep_tx,
+            grep_rx,
+            grep_cancel: None,
         }
     }
 
@@ -180,6 +216,26 @@ impl LogViewerApp {
         };
 
         self.load_paths(paths);
+    }
+
+    /// 通过系统原生对话框选择目录，递归收集目录下的日志文件并批量加载（Q「打开目录」）。
+    pub fn open_directory(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .set_title("打开日志目录")
+            .pick_folder();
+
+        let Some(dir) = picked else {
+            self.state.status_text = "已取消打开目录".to_owned();
+            return;
+        };
+
+        let files = crate::core::dirscan::collect_log_files(&dir);
+        if files.is_empty() {
+            self.state.status_text =
+                format!("目录 {} 下未找到日志文件（.log/.txt/.out）", dir.display());
+            return;
+        }
+        self.load_paths(files);
     }
 
     /// 加载一批路径：文件对话框与「最近文件」共用同一套校验与提示逻辑（M11）。
@@ -283,6 +339,114 @@ impl LogViewerApp {
         std::thread::spawn(move || {
             crate::core::search::run_search(&files, &pattern, &options, &cancel, &tx);
         });
+    }
+
+    /// 启动一次目录检索（"查找全部"）：选择目录后递归检索其下所有日志文件。
+    ///
+    /// 与单文件检索（[`Self::start_search`]）互斥：目录检索运行期间禁用普通检索。
+    fn start_grep(&mut self, root: PathBuf) {
+        let pattern = self.state.search_pattern.trim().to_string();
+        if pattern.is_empty() {
+            return;
+        }
+
+        let options = GrepOptions {
+            search: SearchOptions {
+                mode: self.state.search_mode,
+                case_sensitive: self.state.search_case_sensitive,
+                max_hits: MAX_HITS,
+            },
+            max_hits: MAX_HITS,
+            base: Some(root.clone()),
+        };
+
+        let cancel = CancelToken::new();
+        self.grep_cancel = Some(cancel.clone());
+        self.state.is_grepping = true;
+        self.state.show_results = true;
+        self.state.grep_hits.clear();
+        self.state.grep_selected_row = None;
+        self.state.grep_truncated = false;
+        self.state.grep_error = None;
+        self.state.grep_progress = (0, 0, 0);
+        self.state.grep_root = Some(root.clone());
+        self.state.status_text = "查找全部…".to_owned();
+
+        let tx = self.grep_tx.clone();
+        std::thread::spawn(move || {
+            crate::core::grepdir::run_grep(root, &pattern, &options, &cancel, &tx);
+        });
+    }
+
+    /// 把目录检索命中结果写盘保存（复用 [`crate::core::grepdir::GrepHit`] 内联文本）。
+    fn save_grep_results(&mut self, dest: PathBuf) {
+        let text = results_view::hits_to_text(&self.state.grep_hits);
+        match std::fs::write(&dest, text) {
+            Ok(_) => {
+                self.state.status_text = format!(
+                    "已保存 {} 条命中到 {}",
+                    self.state.grep_hits.len(),
+                    dest.display()
+                );
+            }
+            Err(e) => {
+                self.state.grep_error = Some(format!("保存失败 {}: {e}", dest.display()));
+                self.state.status_text = "保存结果失败，见结果页".to_owned();
+            }
+        }
+    }
+
+    /// 处理一条后台目录检索消息（由 `logic` 每帧 drain）。
+    fn handle_grep_msg(&mut self, msg: GrepMessage) {
+        match msg {
+            GrepMessage::Partial { hits } => {
+                self.state.grep_hits.extend(hits);
+            }
+            GrepMessage::Progress {
+                files_done,
+                files_total,
+                bytes_done,
+            } => {
+                self.state.grep_progress = (files_done, files_total, bytes_done);
+                let pct = if files_total > 0 {
+                    files_done as f64 / files_total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                self.state.status_text = format!(
+                    "查找全部… {pct:.0}% · {} 命中",
+                    crate::util::group_digits(self.state.grep_hits.len())
+                );
+            }
+            GrepMessage::Truncated { hits } => {
+                self.state.grep_truncated = true;
+                self.state.status_text = format!("结果已截断（>{hits} 条），请缩小范围");
+            }
+            GrepMessage::Completed {
+                hits,
+                files,
+                elapsed,
+            } => {
+                self.state.is_grepping = false;
+                self.grep_cancel = None;
+                self.state.status_text = format!(
+                    "查找全部完成：{files} 个文件中 {} 行命中，耗时 {:.2?}",
+                    crate::util::group_digits(hits),
+                    elapsed
+                );
+            }
+            GrepMessage::Failed(e) => {
+                self.state.is_grepping = false;
+                self.grep_cancel = None;
+                self.state.grep_error = Some(e);
+                self.state.status_text = "查找全部失败，见结果页".to_owned();
+            }
+            GrepMessage::Cancelled => {
+                self.state.is_grepping = false;
+                self.grep_cancel = None;
+                self.state.status_text = "已取消查找".to_owned();
+            }
+        }
     }
 
     /// 通过系统原生保存对话框选择导出目标，并启动后台流式导出（M5 / T17）。
@@ -440,8 +604,18 @@ impl eframe::App for LogViewerApp {
                 Err(_) => break,
             }
         }
+        // 目录检索消息（"查找全部"）同样共享每帧 drain 上限。
+        while n < MAX_MSG_PER_FRAME {
+            match self.grep_rx.try_recv() {
+                Ok(msg) => {
+                    self.handle_grep_msg(msg);
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
         // 仅后台有活动时才请求重绘，空闲时不烧 CPU（spec §8.4）。
-        if self.state.is_searching || self.state.is_exporting {
+        if self.state.is_searching || self.state.is_exporting || self.state.is_grepping {
             ctx.request_repaint();
         }
     }
@@ -460,6 +634,43 @@ impl eframe::App for LogViewerApp {
         if self.state.pending_open && !self.state.is_searching {
             self.state.pending_open = false;
             self.open_files();
+        }
+        // 打开目录（Q「打开目录」）：检索中禁用。
+        if self.state.pending_open_dir && !self.state.is_searching {
+            self.state.pending_open_dir = false;
+            self.open_directory();
+        }
+        // 查找全部：弹出目录选择，选中后启动目录检索（与普通检索互斥）。
+        if self.state.pending_grep && !self.state.is_searching && !self.state.is_grepping {
+            self.state.pending_grep = false;
+            let picked = rfd::FileDialog::new()
+                .set_title("查找目录（查找全部）")
+                .pick_folder();
+            if let Some(dir) = picked {
+                self.start_grep(dir);
+            }
+        }
+        // 保存目录检索结果。
+        if self.state.pending_grep_save {
+            self.state.pending_grep_save = false;
+            let default_name = format!(
+                "hyper-log-grep-{}.log",
+                crate::util::export_filename_stamp()
+            );
+            let picked = rfd::FileDialog::new()
+                .set_title("保存查找结果")
+                .set_file_name(&default_name)
+                .save_file();
+            if let Some(path) = picked {
+                self.save_grep_results(path);
+            }
+        }
+        // 取消目录检索。
+        if self.state.pending_grep_stop {
+            self.state.pending_grep_stop = false;
+            if let Some(c) = &self.grep_cancel {
+                c.cancel();
+            }
         }
         // 最近文件（M11）：同样在检索中禁用（G1）。
         if !self.state.is_searching
@@ -497,7 +708,12 @@ impl eframe::App for LogViewerApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(bg))
             .show(ui, |ui| {
-                log_view::show(ui, &mut self.state);
+                // 目录检索结果页：独立视图，替换日志正文。
+                if self.state.show_results {
+                    results_view::show(ui, &mut self.state);
+                } else {
+                    log_view::show(ui, &mut self.state);
+                }
             });
 
         // 性能 HUD（spec P4/P5/P6 可观测化）：仅在开启时绘制，且不主动请求重绘，

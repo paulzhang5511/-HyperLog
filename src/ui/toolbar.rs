@@ -16,6 +16,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             {
                 state.pending_open = true;
             }
+            // 打开目录（Q「打开目录」）：递归加载目录下所有日志文件。
+            if ui
+                .add_enabled(!state.is_searching, egui::Button::new("打开目录"))
+                .clicked()
+            {
+                state.pending_open_dir = true;
+            }
 
             // 最近文件（M11 / spec Q3）：检索中整体禁用（G1）
             ui.add_enabled_ui(!state.is_searching, |ui| {
@@ -80,6 +87,22 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 }
             } else if ui.button("查找").clicked() && !state.search_pattern.trim().is_empty() {
                 state.pending_search = true;
+            }
+
+            // 查找全部（Q「查找全部」）：对目录递归检索；进行中显示「停止」。
+            if state.is_grepping {
+                if ui.button("停止查找全部").clicked() {
+                    state.pending_grep_stop = true;
+                }
+            } else if ui
+                .add_enabled(
+                    !state.is_searching && !state.search_pattern.trim().is_empty(),
+                    egui::Button::new("查找全部"),
+                )
+                .on_hover_text("选择目录，递归检索目录下所有日志文件")
+                .clicked()
+            {
+                state.pending_grep = true;
             }
 
             // 命中计数与结果视图切换（T15：检索中仅禁用 打开/搜索/导出）
