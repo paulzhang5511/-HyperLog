@@ -126,6 +126,23 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 // 性能 HUD 开关（spec P4/P5/P6 现场观测；也可经 HYPER_LOG_PERF=1 默认开启）
                 ui.toggle_value(&mut state.show_perf, "性能");
 
+                ui.separator();
+
+                // 明暗主题切换：默认暗色（app::setup_theme），点击切到另一套。
+                // egui 0.36 的 dark/light 是两套独立 Style，set_theme 只切换当前使用的那套。
+                let current = ui.ctx().theme();
+                let (icon, tip, next) = match current {
+                    egui::Theme::Dark => ("☀", "切换到亮色主题", egui::Theme::Light),
+                    egui::Theme::Light => ("🌙", "切换到暗色主题", egui::Theme::Dark),
+                };
+                if ui
+                    .add(egui::Button::new(icon).frame(false))
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    ui.ctx().set_theme(next);
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let count = state.fileset.file_count();
                     if count > 0 {

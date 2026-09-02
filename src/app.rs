@@ -102,9 +102,51 @@ pub struct LogViewerApp {
     export_cancel: Option<CancelToken>,
 }
 
+/// CJK 兜底字体在 `FontDefinitions::font_data` 中的键名。
+const FONT_CJK: &str = "MiSans";
+
+/// 配置中文字体。
+///
+/// egui 内置字体（Hack / Ubuntu-Light / NotoEmoji）**均不含 CJK 字形**，
+/// 未额外配置时界面与日志中的中文会渲染成空白方块（豆腐块）。
+///
+/// 这里把 MiSans 作为**兜底字体追加**到 Proportional / Monospace 两个字体族末尾，
+/// 而不是替换主字体：
+/// - 拉丁字符仍由内置字体绘制，Monospace 保持等宽，日志列对齐不受影响；
+/// - 仅当内置字体缺字形时（中文等 CJK 字符）才回退到 MiSans。
+///
+/// 字体经 `include_bytes!` 编译进二进制，打包为 `.app` 后无需附带资源目录。
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        FONT_CJK.to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/MiSans-Normal.ttf"
+        ))),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push(FONT_CJK.to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// 默认暗色主题。
+///
+/// egui 0.36 的 `theme_preference` 默认为 `System`（跟随系统），这里显式固定为暗色；
+/// `sync_window_theme` 默认为 true，会一并同步 macOS 原生窗口标题栏为暗色。
+fn setup_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+}
+
 impl LogViewerApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         log::info!("Hyper Log starting up");
+        setup_theme(&cc.egui_ctx);
+        setup_fonts(&cc.egui_ctx);
         let show_perf = std::env::var("HYPER_LOG_PERF")
             .map(|v| v == "1")
             .unwrap_or(false);
