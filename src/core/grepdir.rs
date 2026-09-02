@@ -221,8 +221,10 @@ fn display_path(path: &std::path::Path, base: Option<&std::path::Path>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::search::SearchMode;
+    use crate::core::dirscan::collect_log_files;
+    use crate::core::search::{CancelToken, SearchMode, SearchOptions};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     /// 生成唯一的临时目录名，避免并行测试间相互删除对方的数据。
     fn tmp_dir() -> PathBuf {
@@ -347,5 +349,63 @@ mod tests {
         assert!(total <= 5);
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 目录检索样本目录（需自备，内含一个较大的 .log 才能体现块间取消的意义）。
+    fn require_grep_sample() -> PathBuf {
+        let p = PathBuf::from("/tmp/bench_grep_dir");
+        assert!(
+            p.is_dir() && !collect_log_files(&p).is_empty(),
+            "缺少目录检索样本 /tmp/bench_grep_dir；请先：mkdir -p /tmp/bench_grep_dir && scripts/gen_log.sh /tmp/bench_grep_dir/big.log 20000000"
+        );
+        p
+    }
+
+    /// P10（目录检索版）：「停止查找全部」取消响应延迟 < 500 ms（spec §11.2 P10 / G1）。
+    ///
+    /// 锁定 M14 修复：原 `search_one_file` 仅在文件间检查取消令牌，单大文件整扫时「停止」无效；
+    /// 修复后块间每 8 MiB 检查一次，取消应在数毫秒内回落（受单块扫描耗时约束，远低于 500ms）。
+    #[test]
+    #[ignore]
+    fn grep_cancel_response_under_500ms() {
+        let root = require_grep_sample();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let cancel = CancelToken::new();
+        let c2 = cancel.clone();
+        let opt = GrepOptions {
+            search: SearchOptions {
+                mode: SearchMode::Plain,
+                case_sensitive: false,
+                max_hits: usize::MAX,
+            },
+            max_hits: usize::MAX,
+            base: Some(root.clone()),
+        };
+        let handle = std::thread::spawn(move || {
+            run_grep(root, "ERROR", &opt, &c2, &tx);
+        });
+        std::thread::sleep(Duration::from_millis(50)); // 让检索先跑起来
+        let t_cancel = Instant::now();
+        cancel.cancel();
+
+        let mut latency = None;
+        let deadline = t_cancel + Duration::from_secs(2);
+        while latency.is_none() {
+            match rx.try_recv() {
+                Ok(GrepMessage::Cancelled) | Ok(GrepMessage::Completed { .. }) => {
+                    latency = Some(t_cancel.elapsed());
+                }
+                _ => {
+                    if Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        handle.join().unwrap();
+        let latency = latency.expect("应收到终止消息（Cancelled 或 Completed）");
+        println!("目录检索取消响应延迟: {latency:?}");
+        assert!(latency.as_secs_f64() < 0.5, "P10 未达标：{latency:?}");
     }
 }
