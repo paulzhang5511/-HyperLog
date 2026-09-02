@@ -94,6 +94,8 @@ pub struct AppState {
     frame_ms: Vec<f32>,
     /// 上一帧时间戳（秒，取自 `ctx.input().time`），用于计算帧间隔。
     last_frame_sec: f64,
+    /// 性能日志上次打印时刻（ctx.time，秒），用于 `HYPER_LOG_PERF_LOG=1` 节流（每 ~1s 一行）。
+    perf_log_last_sec: f64,
 
     // —— 侧边栏目录树（spec §7.7 侧边栏）——
     /// 是否显示左侧文件目录树。
@@ -197,7 +199,7 @@ fn setup_fonts(ctx: &egui::Context) {
 }
 
 impl LogViewerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, initial_paths: Vec<std::path::PathBuf>) -> Self {
         log::info!("Hyper Log starting up");
         // 编辑器风格主题（默认暗色），再装字体：主题只改颜色，字体与主题互不影响。
         theme::apply(&cc.egui_ctx);
@@ -208,7 +210,7 @@ impl LogViewerApp {
         let (search_tx, search_rx) = crossbeam_channel::unbounded();
         let (export_tx, export_rx) = crossbeam_channel::unbounded();
         let (grep_tx, grep_rx) = crossbeam_channel::unbounded();
-        Self {
+        let mut app = Self {
             state: AppState {
                 show_perf,
                 recents: Recents::load(),
@@ -223,7 +225,12 @@ impl LogViewerApp {
             grep_tx,
             grep_rx,
             grep_cancel: None,
+        };
+        // 启动即载入（命令行 `--open`/位置参数）：M16 为支撑实机观测与「终端秒开日志」而加。
+        if !initial_paths.is_empty() {
+            app.load_paths(initial_paths);
         }
+        app
     }
 
     /// 全局快捷键（spec §7.7 常用快捷键）。
@@ -724,6 +731,15 @@ impl eframe::App for LogViewerApp {
         if self.state.is_searching || self.state.is_exporting || self.state.is_grepping {
             ctx.request_repaint();
         }
+
+        // 测量辅助（默认关闭）：HYPER_LOG_REPAINT=1 时强制每帧重绘，便于性能 HUD 在无人工
+        // 滚动/检索时稳定采样 P4/P5/P6（不影响 P12——不设置该变量时空闲仍不重绘）。
+        if std::env::var("HYPER_LOG_REPAINT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            ctx.request_repaint();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -874,6 +890,22 @@ impl eframe::App for LogViewerApp {
                     ));
                     ui.label("P5: 虚拟滚动，节点数≈视口行+10（代码审查）");
                     ui.label("P6: 检索峰值帧见「峰值」行应 < 50ms");
+
+                    // 测量辅助（默认关闭）：HYPER_LOG_PERF_LOG=1 时把指标打到 stderr，
+                    // 便于无头/CI 环境采样 P4(p95)/P6(峰值)（配合 HYPER_LOG_REPAINT=1 持续重绘）。
+                    if std::env::var("HYPER_LOG_PERF_LOG")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                    {
+                        let now = ui.ctx().input(|i| i.time);
+                        if now - self.state.perf_log_last_sec > 1.0 {
+                            self.state.perf_log_last_sec = now;
+                            eprintln!(
+                                "hyper_log PERF fps={fps:.1} p95={p95:.1}ms peak={peak:.1}ms last={last:.1}ms frames={}",
+                                ms.len()
+                            );
+                        }
+                    }
                 });
         }
     }
