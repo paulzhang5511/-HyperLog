@@ -10,7 +10,7 @@ use crate::core::recents::Recents;
 use crate::core::search::{
     CancelToken, SearchError, SearchHit, SearchMessage, SearchMode, SearchOptions,
 };
-use crate::ui::{log_view, status_bar, toolbar};
+use crate::ui::{log_view, status_bar, theme, toolbar};
 
 /// 每帧最多处理 1000 条后台消息，防止消息洪水饿死渲染（spec §8.4，对应 D6）。
 const MAX_MSG_PER_FRAME: usize = 1000;
@@ -29,6 +29,10 @@ pub struct AppState {
     pub highlighter: crate::highlight::Highlighter,
     /// 是否启用折行显示（默认关闭，横向滚动；见 spec G7）。
     pub wrap: bool,
+    /// 当前选中的行（全量视图为全局行号，命中视图为命中索引），供高亮与复制使用。
+    pub selected_row: Option<usize>,
+    /// 估算的最长行渲染宽度（像素），用于固定横向滚动范围，避免滚动条随虚拟滚动抖动。
+    pub max_line_width: f32,
     /// toolbar 置位后，在 `ui` 中弹出打开文件对话框。
     pub pending_open: bool,
     /// 最近打开的文件列表（M11 / spec Q3），持久化在平台配置目录。
@@ -134,18 +138,11 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// 默认暗色主题。
-///
-/// egui 0.36 的 `theme_preference` 默认为 `System`（跟随系统），这里显式固定为暗色；
-/// `sync_window_theme` 默认为 true，会一并同步 macOS 原生窗口标题栏为暗色。
-fn setup_theme(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Dark);
-}
-
 impl LogViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         log::info!("Hyper Log starting up");
-        setup_theme(&cc.egui_ctx);
+        // 编辑器风格主题（默认暗色），再装字体：主题只改颜色，字体与主题互不影响。
+        theme::apply(&cc.egui_ctx);
         setup_fonts(&cc.egui_ctx);
         let show_perf = std::env::var("HYPER_LOG_PERF")
             .map(|v| v == "1")
@@ -234,6 +231,11 @@ impl LogViewerApp {
         if loaded > 0 {
             self.state.recents.save();
         }
+
+        // 新文件可能比已加载的更宽，重新估算横向滚动范围；行号语义也随之变化，清掉选中行。
+        let max_line_width = log_view::estimate_content_width(&self.state.fileset);
+        self.state.max_line_width = max_line_width;
+        self.state.selected_row = None;
 
         let total = self.state.fileset.total_lines();
         let size = crate::util::human_bytes(self.state.fileset.total_bytes() as u64);
@@ -489,9 +491,14 @@ impl eframe::App for LogViewerApp {
 
         toolbar::show(ui, &mut self.state);
         status_bar::show(ui, &self.state);
-        egui::CentralPanel::default().show(ui, |ui| {
-            log_view::show(ui, &self.state);
-        });
+        // 日志区用编辑器正文底色（与顶栏/底栏区分），且不留窗口内边距：
+        // 行号槽要从最左侧开始，否则整块行背景会与正文错位。
+        let bg = theme::palette(ui.ctx()).bg;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(bg))
+            .show(ui, |ui| {
+                log_view::show(ui, &mut self.state);
+            });
 
         // 性能 HUD（spec P4/P5/P6 可观测化）：仅在开启时绘制，且不主动请求重绘，
         // 避免拉高空闲 CPU（P12）。窗口内容仅在产生新帧时（滚动/检索）刷新。

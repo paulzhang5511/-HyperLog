@@ -436,19 +436,25 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ [打开文件] [关闭] │ 检索: [____________] [模式▾][Aa] [搜索/停止] │
-│                    │ [导出结果] [折行]                          │
+│ Hyper Log │ [打开][最近文件▾] │ [查找…][模式▾][Aa][查找] │ [折行][性能][☀] │
 ├──────────────────────────────────────────────────────────────┤
-│ 1  2026-09-01 10:00:01.123  INFO  ... (虚拟滚动)              │
-│ 2  2026-09-01 10:00:01.456  ERROR ...                        │
-│ ...                                                          │
+│   1 │ 2026-09-01 10:00:01.123  INFO  ... (虚拟滚动)          │
+│   2 │ 2026-09-01 10:00:01.456  ERROR ...                    │
+│ ... │ ...                                                  │
 ├──────────────────────────────────────────────────────────────┤
-│ 已加载 3 个文件 / 12,345,678 行 (1.2 GB) │ [======>   ] 62%   │
+│ status │ 文件名 │ 索引 xx │ xx GB │ xx 行 │ xx 个文件 │ [行 123] │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- 行号列：右对齐等宽，宽度按最大行号位数自适应。
-- `Wrap` 关闭时启用 `ScrollArea` 双向滚动；开启时 `show_rows` 的行高估算需改为按字符数动态计算（P1，MVP 可先固定）。
+- **编辑器观感**（Q7）：默认暗色主题（VS Code Dark+ 风格），`src/ui/theme.rs` 统一维护
+  `dark_style`/`light_style` 两套 `Style` 与一套 `Palette`（供日志区 `Painter` 自绘取色），
+  工具栏 ☀/🌙 切换。控件扁平化（低饱和背景 + 细描边），紧凑间距（按钮 22px、正文 12.5px）。
+- **行号槽**：独立背景色 + 与正文之间的竖线；行号右对齐等宽，宽度按最大行号位数自适应。
+- **行级交互**：hover 高亮整行、点击选中（⌘C/Ctrl+C 复制选中行）、右键「复制此行」。
+- **单 widget 渲染**：每行只创建 1 个 `Label` 承载整行的多色 `LayoutJob`（时间戳/级别/命中
+  分段合成一个 job），行背景与行号用 `Painter` 绘制，widget 数从 O(行×分段) 降到 O(行)（§8.4）。
+- `Wrap` 关闭时启用 `ScrollArea` 双向滚动，横向范围按「采样的最长行宽」固定（CJK 按 1.7 倍宽加权）；
+  开启时行高统一按最长行的折行数放大（`MAX_WRAP_LINES` 封顶，P1 的 MVP 方案）。
 - 检索中**不禁用**滚动区与"停止"按钮（G1）；仅禁用"打开文件""导出""搜索"自身。
 
 ### 7.8 `core::export` —— 流式导出（修复 D8 / G8）
@@ -801,6 +807,8 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | **M9** | ✅ 完成 | 见 §14（性能 HUD 可观测化 P4/P5/P6/P12 + P2 验收测试 + §8.4 空闲重绘策略确认） |
 | **M10** | ✅ 完成 | 见 §14（打包：scripts/package_macos.sh → HyperLog.app + zip，提前交付 G11） |
 | **M11** | ✅ 完成 | 见 §14（Q3 最近文件：src/core/recents.rs 零依赖持久化 + 工具栏「最近文件」菜单） |
+| **M12a** | ✅ 完成 | `cff35e0`（内嵌 MiSans 中文字体 + 默认暗色主题） |
+| **M12b** | ✅ 完成 | 见 §14（编辑器风格 UI：主题/行号槽/单 widget 渲染/时间戳着色/顶底栏） |
 
 > 说明：M1/M2 合并于同一提交，因为 `core::indexer` 的 API 必须被 UI 消费后才不会触发
 > `clippy -D warnings` 的 dead_code 门禁，单独提交索引器会使 CI 在合并前变红。
@@ -846,3 +854,5 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-02 | M10 收尾修补：`/dist/` 加入 `.gitignore`（打包产物此前会以 `?? dist/` 污染 `git status`）；`scripts/package_macos.sh` 补可执行位（原 644，与同目录其它脚本 755 不一致）。端到端复跑打包脚本通过，产物 `dist/HyperLog.app` 12M / `dist/HyperLog-macos.zip` 5.3M | Agent |
 | 2026-09-02 | M11 最近文件（Q3）：新增 `src/core/recents.rs`——**零新增依赖**（eframe 的 `persistence` 特性需拉入 `serde`+`ron`，正是 Q3 当初推迟的理由，故改用 `std::fs` 纯文本持久化）。按行存储绝对路径、最近优先、上限 10 条；读取时丢弃空行/重复/已失效条目；写入走「临时文件 + `rename`」。存储位置 macOS `~/Library/Application Support/hyper-log/recent_files.txt`、Windows `%APPDATA%\hyper-log\`、其它 `~/.config/hyper-log/`。`app.rs` 把打开逻辑抽为 `load_paths()`，供文件对话框与最近文件共用，仅成功打开才记账；工具栏新增「最近文件」菜单（检索中禁用 G1，含「清除最近文件」）。沿用「追加而非替换」语义（MVP 无关闭单个文件能力）。新增 5 个单测；门禁 clippy/fmt/29 单测全绿 | Agent |
 | 2026-09-02 | M10 提前交付打包（G11）：新增 `scripts/package_macos.sh`，`cargo build --release` 后组装 `dist/HyperLog.app`（Info.plist + 二进制 + ad-hoc 签名），并打包 `dist/HyperLog-macos.zip`（5.3M）；冒烟验证 `.app` 内二进制启动 ALIVE（Glow）。G11 由「P2 待定」改为 M10 ✅；§12.12 增补 `.app` 分发说明；§12.1 增 M10 | Agent |
+| 2026-09-02 | M12a 字体与主题：egui 内置字体（Hack/Ubuntu-Light/NotoEmoji）均无 CJK 字形，中文渲染成豆腐块。`assets/fonts/MiSans-Normal.ttf` 经 `include_bytes!` 内嵌进二进制，作为兜底追加到 Proportional/Monospace 两族末尾（不替换主字体，拉丁字符仍由内置字体绘制、Monospace 保持等宽列对齐）。默认主题固定暗色（`theme_preference` 默认 System），工具栏加 ☀/🌙 切换。副作用：release 二进制 12M→19M | Agent |
+| 2026-09-02 | M12b 编辑器风格 UI：新增 `src/ui/theme.rs`（VS Code Dark+/Light+ 两套 `Style` + `Palette`，控件扁平化/紧凑间距/正文 12.5px）；`log_view.rs` 重写为行号槽 + 单 widget 渲染（每行 1 个 `Label` 承载多色 `LayoutJob`，行背景/行号用 `Painter` 绘制，widget 数 O(行×分段)→O(行)），hover 高亮、点击选中 + ⌘C 复制、右键复制，横向滚动范围按采样最长行宽（CJK 1.7 倍加权）固定；`highlight.rs` 新增 `Segment::Timestamp`（ISO/logcat/纯时间三形态正则）；顶栏分组弱化标题、底栏改分段信息（文件数·行数·体积·索引内存·选中行）。§7.7 重写，41 单测全绿 | Agent |
