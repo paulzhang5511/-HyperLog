@@ -131,7 +131,7 @@
 | 文件对话框 | `rfd` | 0.15 | 打开 / 保存对话框 |
 | 日志 | `log` + `env_logger` | 0.4 / 0.11 | 替代 `println!` |
 | 时间格式化 | `chrono` | 0.4.45 | 导出默认文件名本地时间戳（T17，M5 新增） |
-| 序列化（配置） | *待定* | — | 仅在需要持久化窗口/偏好时引入（P2） |
+| 序列化（配置） | `std::fs`（零新增依赖） | — | M17 已落地：主题/窗口几何/折行/侧栏/最近检索词经 `core/prefs.rs` 纯文本持久化（平台配置目录 + tmp/rename 原子写）；核心层用自有 `ThemePref` 枚举，避免在 `core` 内依赖 `egui`（P2） |
 
 **发布构建 profile**（追加到 `Cargo.toml`）：
 
@@ -891,6 +891,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | **M14** | ✅ 完成 | 见 §14（⌘快捷键 + 侧边栏目录树 + 行号跳转 + 高亮对比度修复 + 查找全部停止 bug 修复） |
 | **M15** | ✅ 完成 | 见 §14（Q6 外部文件修改检测：状态栏告警 + 重新加载） |
 | **M16** | ✅ 完成 | 见 §14（GUI 验收首轮实机/无头观测 P4/P5/P6 + 观测开关：`--open`/`HYPER_LOG_REPAINT`/`HYPER_LOG_PERF_LOG`） |
+| **M17** | ✅ 完成 | 见 §14（用户偏好持久化：主题/窗口几何/折行/侧栏/最近检索词，`core/prefs.rs` 零依赖 `std::fs` + 容错解析 + 原子写） |
 
 > 说明：M1/M2 合并于同一提交，因为 `core::indexer` 的 API 必须被 UI 消费后才不会触发
 > `clippy -D warnings` 的 dead_code 门禁，单独提交索引器会使 CI 在合并前变红。
@@ -945,3 +946,4 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-03 | M14 查找全部取消回归测试（锁定「停止」bug 修复）：`grepdir.rs` 新增 `#[ignore]` 测试 `grep_cancel_response_under_500ms`，自备大目录样本 `/tmp/bench_grep_dir`（含 ≥100MB 的 .log，如 `scripts/gen_log.sh /tmp/bench_grep_dir/big.log 20000000`）后 `cargo test --release -- --ignored grep_cancel_response_under_500ms` 运行。断言取消后 ≤500ms 收到 `GrepMessage::Cancelled`（实测 0.37s），锁定 M14 在 `search_one_file` 块间加 `cancel.is_cancelled()` 的修复（G1/P10）。忽略测试总数 7→8 | Agent |
 | 2026-09-03 | M15 Q6 外部文件修改检测（spec §7.7 / §13）：`core::indexer.rs::FileSet` 新增 `opened_len`/`opened_mtime`（open 时记录）与纯函数 `detect_dirty`（节流 ~1s 比对 mtime/体积，与 ctx 解耦可单测）；`app.rs::logic()` 轮询写 `state.dirty_files`，`ui()` 在 `pending_reload` 时调 `reload_all()`（清空旧索引重开，不触碰 mmap，规避 macOS truncate 致 SIGBUS 的 D15）；`ui/status_bar.rs` 改签名 `show(ui, state)`，脏文件非空时渲染琥珀色「N 个文件被外部修改」+「重新加载」按钮。`app.rs` 新增 `sidebar_active_file`、`dirty_files`/`last_dirty_check`/`pending_reload` 字段。新增 `detect_dirty_flags_external_modification` 单测（50 总）。Q2(Linux) 明确 MVP 不含，目标平台仅 macOS + Windows 11；§13 表 Q6 行改「已落地状态栏提示 + 重新加载」、§13.1 补 Q6 由 M15 落地结论。门禁 fmt/clippy(-D warnings)/50 单测/发布构建均绿 | Agent |
 | 2026-09-03 | M16 GUI 验收首轮观测（P4/P5/P6/P12）+ 观测开关：① 启动即载入 `main.rs` 解析 `-o/--open <path>` 与位置参数，`app.rs::new` 收集后调 `load_paths`（终端秒开 + 自动化观测）；② `app.rs::logic` 新增默认关的测量辅助 `HYPER_LOG_REPAINT=1`（强制每帧重绘，无交互也可稳定采样）；③ 性能 HUD（`show_perf` 块）新增 `HYPER_LOG_PERF_LOG=1`：每 ~1s 把 `fps/p95/峰值/帧数` 打到 stderr，`AppState` 加 `perf_log_last_sec` 节流。无头实测（xlarge.log 1.2GB + 三开关）：稳态 fps≈60、p95≈21ms、峰值≈21ms（21ms 为无 GPU 软件渲染抖动）；据此 **P6 ✅（峰值 21ms ≪ 50ms 即便软件渲染）**、**P5 ✅（1.2GB 帧耗时与规模无关，虚拟滚动常量开销）**，P4 avg 60fps 但 p95 受软件渲染抬到 21ms（真机 GPU 受 vsync 限 ~16.6ms 预期达标，需真机 HUD 复测），P12 无头沙箱 `ps`/`top` 无 CPU 记账权限无法读数（§8.4 设计保证，需真机活动监视器确认）。无头窗口未注册进窗口服务器，故 HUD 截图不可行，改用 stderr 日志量化。§11.2.1 补 P4/P5/P6/P12 实测行、§12.1 增 M16、§14 本行记录。门禁 fmt/clippy(-D warnings)/50 单测/发布构建均绿 | Agent |
+| 2026-09-03 | M17 用户偏好持久化（spec §1.3 待定 P2「序列化（配置）」）：① 新增 `src/core/prefs.rs`——零新增依赖，`key=value` 容错解析（未知键/非法值/损坏行/空 recent 安全忽略，绝不 panic）、tmp/rename 原子写盘、最近检索词去重最近优先上限 10；自有 `ThemePref{Dark,Light}` 枚举（核心层禁止依赖 `egui`，在 `ui/theme.rs` 用双向 `From` 映射到 `egui::Theme`）；存储位置 macOS `~/Library/Application Support/hyper-log/prefs.txt`、Windows `%APPDATA%\hyper-log\`、其它 `~/.config/hyper-log/`。② `AppState` 增 `prefs`/`last_prefs_save` 与 `save_prefs()`（同步实时 `wrap`/`show_sidebar` 后写盘）；`main.rs` 启动 `Prefs::load()` 并经 `LogViewerApp::new(cc, initial_paths, prefs)` 注入，`viewport` 用持久化窗口尺寸；`theme.rs::apply` 改收 `theme` 参数。③ 即时保存：工具栏「☰侧栏」/「折行」/主题 ☀🌙 切换、⌘B、检索提交（记最近检索词）均调 `save_prefs`；`logic()` 节流（尺寸确变且距上次 >2s）写窗口几何。沿用 M11 的 `std::fs` 纯文本思路，不引入 eframe `persistence`（需 `serde`+`ron`），故 Q3 当初推迟理由不变。§1.3 序列化（配置）待定→已落地 M17、§12.1 增 M17、§14 本行记录。门禁 fmt/clippy(-D warnings)/54 单测（含 4 个新 prefs 单测）/8 ignored/发布构建/窗口冒烟 ALIVE 均绿 | Agent |
