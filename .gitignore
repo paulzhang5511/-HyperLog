@@ -10,6 +10,9 @@
 /tmp/
 /bench/
 
+# 本地测试日志样本（scripts/gen_sample_logs.py 产出，含 1GB 压测文件，不入库）
+/sample_logs/
+
 # 导出过程中的临时文件
 *.log.tmp
 
