@@ -45,6 +45,10 @@ pub struct LogFileIndex {
     mmap: Arc<Mmap>,
     /// 每行起始字节偏移（相对于整个 mmap，已含 BOM 跳过），长度 == 总行数。
     line_offsets: Vec<usize>,
+    /// 打开时记录的文件体积（字节），用于检测外部 truncate/轮转（spec Q6）。
+    pub opened_len: u64,
+    /// 打开时记录的文件修改时间，用于检测外部修改（spec Q6）；获取失败为 `None`（跳过检测，避免误报）。
+    pub opened_mtime: Option<std::time::SystemTime>,
 }
 
 /// 多文件集合：把「文件 i 的第 j 行」统一映射为 `0..total_lines` 的全局行号。
@@ -67,13 +71,14 @@ impl LogFileIndex {
             source,
         })?;
 
-        let len = file
-            .metadata()
-            .map_err(|source| IndexError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .len();
+        let meta = file.metadata().map_err(|source| IndexError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let len = meta.len();
+        // 记录打开时的体积与修改时间，供 `FileSet::detect_dirty` 检测外部修改（spec Q6）。
+        let opened_len = len;
+        let opened_mtime = meta.modified().ok();
 
         if len == 0 {
             return Err(IndexError::Empty(path.to_path_buf()));
@@ -103,6 +108,8 @@ impl LogFileIndex {
             path: path.to_path_buf(),
             mmap: Arc::new(mmap),
             line_offsets,
+            opened_len,
+            opened_mtime,
         })
     }
 
@@ -268,6 +275,33 @@ impl FileSet {
             return None;
         }
         Some(idx)
+    }
+
+    /// 清空集合（保留 `cumulative` 哨兵），用于「重新加载」（spec Q6）。
+    pub fn clear(&mut self) {
+        self.files.clear();
+        self.cumulative = vec![0];
+    }
+
+    /// 检测被外部修改/截断/轮转的文件（spec Q6）：对每个文件 stat，对比打开时记录的
+    /// 体积或修改时间。返回被修改文件的路径列表（可能为空）。逻辑与渲染解耦，可单测。
+    ///
+    /// 注意：只读检测、不触碰 mmap，因此不会触发 macOS 上 truncate 导致的 SIGBUS（D15）；
+    /// 真正的重载由 UI 的「重新加载」按钮触发（先关闭旧 mmap 再重新打开）。
+    pub fn detect_dirty(&self) -> Vec<PathBuf> {
+        let mut dirty = Vec::new();
+        for f in &self.files {
+            if let Some(m) = f.opened_mtime
+                && let Ok(meta) = std::fs::metadata(&f.path)
+            {
+                let changed =
+                    meta.len() != f.opened_len || meta.modified().ok().is_some_and(|mt| mt != m);
+                if changed {
+                    dirty.push(f.path.clone());
+                }
+            }
+        }
+        dirty
     }
 
     /// 已加载文件列表（只读），供检索引擎快照扫描（spec §7.3 / M4）。
@@ -502,6 +536,31 @@ mod tests {
         assert_eq!(set.file_for_global_row(a_lines + b_lines - 1), Some(1));
         // 越界（== 总行数）返回 None
         assert_eq!(set.file_for_global_row(a_lines + b_lines), None);
+    }
+
+    /// `detect_dirty` 应发现被外部修改的文件（spec Q6）。
+    #[test]
+    fn detect_dirty_flags_external_modification() {
+        let dir = std::env::temp_dir().join(format!("hyperlog_dirty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.log");
+        std::fs::write(&p, "line one\nline two\n").unwrap();
+
+        let mut set = FileSet::new();
+        let idx = Arc::new(LogFileIndex::open(&p).unwrap());
+        let opened_len = idx.opened_len;
+        set.push(idx);
+        assert!(set.detect_dirty().is_empty(), "未修改时应无脏文件");
+
+        // 外部追加内容（模拟日志滚动写入）
+        std::fs::write(&p, "line one\nline two\nline three\n").unwrap();
+        let dirty = set.detect_dirty();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0], p);
+        assert_ne!(std::fs::metadata(&p).unwrap().len(), opened_len);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 大文件性能验收（spec §11.2，对应 T19）。

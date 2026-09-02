@@ -101,6 +101,14 @@ pub struct AppState {
     /// 侧边栏当前高亮（已跳转）的文件索引；点击文件后置位并持久高亮，类似 VSCode 高亮已打开文件。
     pub sidebar_active_file: Option<usize>,
 
+    // —— 外部文件修改检测（spec Q6）——
+    /// 被外部修改/截断/轮转的文件路径列表（状态栏告警 + 「重新加载」依据），由 `logic` 节流检测。
+    pub dirty_files: Vec<PathBuf>,
+    /// 上次脏检查的时刻（ctx.time，秒），节流到约每秒一次避免频繁 stat。
+    pub last_dirty_check: f64,
+    /// 状态栏「重新加载」置位后，在 `ui` 中清空并重新打开所有已加载文件（spec Q6）。
+    pub pending_reload: bool,
+
     // —— 行号跳转（spec §7.7 行跳转）——
     /// 行号跳转输入框的缓冲区（1-based 全局行号）。
     pub line_jump: String,
@@ -365,6 +373,31 @@ impl LogViewerApp {
             format!("已加载 {loaded} 个文件（跳过 {skipped}），共 {total} 行 / {size}；{tail}")
         };
         log::info!("{}", self.state.status_text);
+    }
+
+    /// 重新加载所有已打开的文件（spec Q6「重新加载」）：关闭旧 mmap 索引（`FileSet::clear`
+    /// 释放 `Arc<LogFileIndex>`）并重新打开，使外部 truncate/轮转后的内容生效。
+    ///
+    /// 重载后行号语义整体变化，故清空选中行/跳转目标/侧边栏高亮/脏标记。后台检索等持有的是旧
+    /// `Arc`，旧 mmap 在其结束前仍有效（不触发 SIGBUS），本方法已在 `ui` 中于非活动期调用（G1）。
+    fn reload_all(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .state
+            .fileset
+            .files()
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.state.fileset.clear();
+        self.state.selected_row = None;
+        self.state.scroll_target = None;
+        self.state.sidebar_active_file = None;
+        self.state.dirty_files.clear();
+        self.state.status_text = "重新加载中…".to_owned();
+        self.load_paths(paths);
     }
 
     /// 启动一次检索：快照已加载文件，后台线程流式回传结果（MVP 禁止并发）。
@@ -647,6 +680,16 @@ impl eframe::App for LogViewerApp {
         }
         self.state.last_frame_sec = now;
 
+        // Q6：节流检测外部文件修改（约每秒一次），避免逐帧 stat 所有文件。
+        // 只读检测、不触碰 mmap，因此不会触发 macOS 上 truncate 导致的 SIGBUS（D15）。
+        if now - self.state.last_dirty_check > 1.0 {
+            self.state.last_dirty_check = now;
+            self.state.dirty_files = self.state.fileset.detect_dirty();
+            if !self.state.dirty_files.is_empty() {
+                ctx.request_repaint();
+            }
+        }
+
         let mut n = 0;
         while n < MAX_MSG_PER_FRAME {
             match self.search_rx.try_recv() {
@@ -737,6 +780,16 @@ impl eframe::App for LogViewerApp {
                 c.cancel();
             }
         }
+        // 重新加载（spec Q6「重新加载」）：清空旧索引并重新打开所有文件，使外部 truncate/轮转生效。
+        // 检索/导出/目录检索进行中禁用（G1），避免与后台线程持有的旧 Arc<LogFileIndex> 竞争。
+        if self.state.pending_reload
+            && !self.state.is_searching
+            && !self.state.is_exporting
+            && !self.state.is_grepping
+        {
+            self.state.pending_reload = false;
+            self.reload_all();
+        }
         // 最近文件（M11）：同样在检索中禁用（G1）。
         if !self.state.is_searching
             && let Some(path) = self.state.pending_open_recent.take()
@@ -766,7 +819,7 @@ impl eframe::App for LogViewerApp {
         }
 
         toolbar::show(ui, &mut self.state);
-        status_bar::show(ui, &self.state);
+        status_bar::show(ui, &mut self.state);
         // 左侧文件目录树（可折叠）：点击文件跳转其首行。
         if self.state.show_sidebar {
             egui::Panel::left("sidebar_panel")

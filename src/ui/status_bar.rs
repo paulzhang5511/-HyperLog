@@ -1,10 +1,22 @@
 use crate::app::AppState;
 use crate::util::{group_digits, human_bytes};
 
-pub fn show(ui: &mut egui::Ui, state: &AppState) {
+pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     egui::Panel::bottom("bottom_panel").show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(&state.status_text);
+
+            // 外部文件修改告警（spec Q6）：提示被外部修改/截断/轮转，提供「重新加载」。
+            if !state.dirty_files.is_empty() {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xE0, 0x9F, 0x3E),
+                    format!("{} 个文件被外部修改", state.dirty_files.len()),
+                );
+                if ui.button("重新加载").clicked() {
+                    state.pending_reload = true;
+                }
+            }
 
             // 导出中显示进度条 + spinner（优先于检索进度，常规使用二者互斥）
             if state.is_exporting {

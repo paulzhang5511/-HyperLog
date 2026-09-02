@@ -884,6 +884,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | **M12b** | ✅ 完成 | 见 §14（编辑器风格 UI：主题/行号槽/单 widget 渲染/时间戳着色/顶底栏） |
 | **M13** | ✅ 完成 | 见 §14（打开目录 + 查找全部 + 独立结果页与保存） |
 | **M14** | ✅ 完成 | 见 §14（⌘快捷键 + 侧边栏目录树 + 行号跳转 + 高亮对比度修复 + 查找全部停止 bug 修复） |
+| **M15** | ✅ 完成 | 见 §14（Q6 外部文件修改检测：状态栏告警 + 重新加载） |
 
 > 说明：M1/M2 合并于同一提交，因为 `core::indexer` 的 API 必须被 UI 消费后才不会触发
 > `clippy -D warnings` 的 dead_code 门禁，单独提交索引器会使 CI 在合并前变红。
@@ -899,7 +900,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | Q3 | 是否需要"最近打开的文件"持久化？ | MVP 不做；**M11 已实现**（`src/core/recents.rs`）——当初的推迟理由是"需引入配置文件依赖"，M11 改用 `std::fs` + 平台配置目录的纯文本持久化，**零新增依赖**，该阻塞点已消解 | 功能范围 |
 | Q4 | 结果上限 2,000,000 是否合适？ | 保持默认，M5 后按实测调 | G6 |
 | Q5 | 导出默认格式用 `RawLines` 还是 `WithPrefix`？ | **默认 `RawLines`**（可直接被其它工具消费），UI 提供勾选 | G8 |
-| Q6 | 是否需要处理"日志文件在打开期间被其它进程 truncate / 删除"？ | MVP **不处理**，在状态栏提示"文件已被修改，请重新加载"需文件监听（P2） | D15 |
+| Q6 | 是否需要处理"日志文件在打开期间被其它进程 truncate / 删除"？ | MVP **不自动重载**，但已落地 spec 推荐的「状态栏提示 + 重新加载」（见 §13.1）：`FileSet::detect_dirty` 节流检测外部修改（mtime/体积），状态栏告警并附「重新加载」按钮，点击后清空旧索引重开（不触碰 mmap，不触发 SIGBUS） | D15 |
 | Q7 | 配色是否需要浅色/深色主题自适应？ | MVP 用 egui 默认主题，§7.6 配色为**默认主题**下的取值，主题切换留到 M5 之后 | §7.6 |
 | Q8 | 单文件上限 16 GB 是否合适？32 位平台不支持 | 保持 16 GB；**明确不支持 32 位平台** | §3 假设 4 |
 | Q9 | 多文件累计加载体积上限？（规划阶段新增，防内存叠加） | 单文件 16 GiB，**累计 32 GiB**，超限拒绝并提示 | §3 假设 5 / T06 |
@@ -912,7 +913,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 - **Q7（主题）**：M6 维持 egui 默认主题。补充：检索改走 `regex::bytes`，其 `(?i)` 按 **ASCII** 大小写折叠；
   高亮仍用 `build_regex`（str 模式，Unicode 大小写折叠），二者对 ASCII 模式等价，故命中与高亮一致（G5）。
 - **Q8 / Q9 / Q10**：实现与 spec 文本一致（单文件 16 GiB、累计 32 GiB、单行截断 100,000 字符），已落地。
-- **Q2（Linux）/ Q3（最近文件）/ Q6（外部 truncate）**：MVP 仍按默认建议**不做/不处理**，留待后续里程碑。
+- **Q2（Linux）/ Q3（最近文件）/ Q6（外部 truncate）**：Q3 由 M11 实现；Q6 由 M15 落地「状态栏提示 + 重新加载」（非自动重载，避免 mmap SIGBUS）；Q2（Linux）MVP 仍**不含**，目标平台仅 macOS + Windows 11。
 
 ---
 
@@ -936,3 +937,4 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-03 | M14 侧边栏目录树显示修正（参考 VSCode 资源管理器）：原 `build_tree` 直接用绝对路径逐层建树，把 Unix 根 `/` 当节点，打开单文件显示成 `/ → Users → … → 文件` 这种深而无用的结构。改为：① 计算所有文件父目录的**最长公共前缀目录**作为根（标签取文件夹名，根目录显 `/`），树内只展示相对结构；② 构建时跳过 `RootDir`/`Prefix` 组件避免挂载点/盘符成节点；③ 目录（`CollapsingHeader` + 📁）在前、文件（📄 + 文件名 + 行数）按名（不区分大小写）排序在后，贴近 VSCode「文件夹优先、组内字母序」；④ 缩进改由 `CollapsingHeader` 天然嵌套承担，去掉手动叠加的 `add_space`（修正逐层双重缩进）；⑤ 新增 `AppState::sidebar_active_file`，点击文件后持久高亮（类似 VSCode 高亮已打开文件），不再因 `scroll_target` 被消费清零而丢失选中态。同步 `app.rs`、`ui/sidebar.rs`、`docs/spec.md` §7.7.4。门禁 fmt/clippy(-D warnings)/48 单测/发布烟测均绿 | Agent |
 | 2026-09-03 | M14 侧边栏收尾打磨：① 新增 `FileSet::file_for_global_row(row)`（`cumulative` 升序 + `partition_point` 二分反查全局行→所属文件），侧边栏据此**反查高亮**当前选中行所属文件（VSCode 高亮光标所在文件）；② 文件行与根节点加**右键菜单**（`Response::context_menu`）：复制路径（`ctx.copy_text`）、在文件管理器中显示（`reveal_in_file_manager`，macOS `open -R`/Windows `explorer /select`/Linux `xdg-open`）、跳到该文件；③ 空目录天然不出现（目录仅作文件中间节点）。egui 0.36 坑：`context_menu` 是 `Response` 方法、菜单关闭用 `ui.close()`（无 `close_menu`）、`push_id` 闭包返回 `InnerResponse<InnerResponse<..>>` 需从 horizontal 闭包直接返回 `sel.clicked()` 避免 `.inner.inner` 类型错乱。`indexer.rs` 加 `fileset_global_row_mapping` 单测（49 总）。门禁 fmt/clippy(-D warnings)/49 单测/发布烟测均绿 | Agent |
 | 2026-09-03 | M14 查找全部取消回归测试（锁定「停止」bug 修复）：`grepdir.rs` 新增 `#[ignore]` 测试 `grep_cancel_response_under_500ms`，自备大目录样本 `/tmp/bench_grep_dir`（含 ≥100MB 的 .log，如 `scripts/gen_log.sh /tmp/bench_grep_dir/big.log 20000000`）后 `cargo test --release -- --ignored grep_cancel_response_under_500ms` 运行。断言取消后 ≤500ms 收到 `GrepMessage::Cancelled`（实测 0.37s），锁定 M14 在 `search_one_file` 块间加 `cancel.is_cancelled()` 的修复（G1/P10）。忽略测试总数 7→8 | Agent |
+| 2026-09-03 | M15 Q6 外部文件修改检测（spec §7.7 / §13）：`core::indexer.rs::FileSet` 新增 `opened_len`/`opened_mtime`（open 时记录）与纯函数 `detect_dirty`（节流 ~1s 比对 mtime/体积，与 ctx 解耦可单测）；`app.rs::logic()` 轮询写 `state.dirty_files`，`ui()` 在 `pending_reload` 时调 `reload_all()`（清空旧索引重开，不触碰 mmap，规避 macOS truncate 致 SIGBUS 的 D15）；`ui/status_bar.rs` 改签名 `show(ui, state)`，脏文件非空时渲染琥珀色「N 个文件被外部修改」+「重新加载」按钮。`app.rs` 新增 `sidebar_active_file`、`dirty_files`/`last_dirty_check`/`pending_reload` 字段。新增 `detect_dirty_flags_external_modification` 单测（50 总）。Q2(Linux) 明确 MVP 不含，目标平台仅 macOS + Windows 11；§13 表 Q6 行改「已落地状态栏提示 + 重新加载」、§13.1 补 Q6 由 M15 落地结论。门禁 fmt/clippy(-D warnings)/50 单测/发布构建均绿 | Agent |
