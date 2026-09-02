@@ -6,6 +6,7 @@ mod util;
 
 use std::path::PathBuf;
 
+use crate::core::prefs::Prefs;
 use app::LogViewerApp;
 
 /// 渲染后端开关。wgpu 在部分 macOS 机型上会因 Metal 着色器编译失败而直接退出，
@@ -39,10 +40,13 @@ fn collect_initial_paths() -> Vec<PathBuf> {
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // M17：加载持久化偏好（窗口几何/主题/折行/侧栏/最近检索词）；取不到时回退默认。
+    let prefs = Prefs::load();
+
     let native_options = eframe::NativeOptions {
         renderer: select_renderer(),
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 860.0])
+            .with_inner_size([prefs.window_w.max(400.0), prefs.window_h.max(300.0)])
             .with_min_inner_size([800.0, 600.0]),
         ..Default::default()
     };
@@ -57,7 +61,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Hyper Log",
         native_options,
-        Box::new(move |cc| Ok(Box::new(LogViewerApp::new(cc, initial_paths)))),
+        Box::new(move |cc| Ok(Box::new(LogViewerApp::new(cc, initial_paths, prefs)))),
     )
 }
 

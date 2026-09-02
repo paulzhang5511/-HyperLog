@@ -19,8 +19,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             ui.separator();
 
             // 侧边栏目录树开关（⌘B 也可切换）
-            ui.toggle_value(&mut state.show_sidebar, "☰")
+            let sb = ui
+                .toggle_value(&mut state.show_sidebar, "☰")
                 .on_hover_text("文件目录树（⌘B）");
+            if sb.clicked() {
+                state.save_prefs();
+            }
 
             // —— 文件组 ——（检索中禁用「打开」，G1）
             if ui
@@ -167,7 +171,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             } else {
                 "折行: 关"
             };
-            ui.toggle_value(&mut state.wrap, wrap_label);
+            let w = ui.toggle_value(&mut state.wrap, wrap_label);
+            if w.clicked() {
+                state.save_prefs();
+            }
 
             // 性能 HUD 开关（spec P4/P5/P6 现场观测；也可经 HYPER_LOG_PERF=1 默认开启）
             ui.toggle_value(&mut state.show_perf, "性能");
@@ -185,6 +192,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 .clicked()
             {
                 ui.ctx().set_theme(next);
+                // M17：主题偏好持久化
+                state.prefs.theme = next.into();
+                state.save_prefs();
             }
         });
 

@@ -123,16 +123,35 @@ pub fn palette(ctx: &egui::Context) -> &'static Palette {
     }
 }
 
-/// 安装两套 `Style` 并把默认主题固定为暗色。
+/// 安装两套 `Style` 并按 `theme` 固定当前使用的那一套。
 ///
-/// egui 0.36 的 `theme_preference` 默认是 `System`（跟随系统），这里显式固定为暗色；
+/// egui 0.36 的 `theme_preference` 默认是 `System`（跟随系统），这里显式固定为给定主题；
 /// `sync_window_theme` 默认为 true，会一并同步 macOS 原生窗口标题栏。
-pub fn apply(ctx: &egui::Context) {
+pub fn apply(ctx: &egui::Context, theme: egui::Theme) {
     ctx.options_mut(|opt| {
         opt.dark_style = Arc::new(style_for(&DARK, true));
         opt.light_style = Arc::new(style_for(&LIGHT, false));
     });
-    ctx.set_theme(egui::Theme::Dark);
+    ctx.set_theme(theme);
+}
+
+/// 核心层主题偏好（`core::prefs::ThemePref`，与 egui 解耦）↔ `egui::Theme`。
+impl From<crate::core::prefs::ThemePref> for egui::Theme {
+    fn from(t: crate::core::prefs::ThemePref) -> Self {
+        match t {
+            crate::core::prefs::ThemePref::Dark => egui::Theme::Dark,
+            crate::core::prefs::ThemePref::Light => egui::Theme::Light,
+        }
+    }
+}
+
+impl From<egui::Theme> for crate::core::prefs::ThemePref {
+    fn from(t: egui::Theme) -> Self {
+        match t {
+            egui::Theme::Dark => crate::core::prefs::ThemePref::Dark,
+            egui::Theme::Light => crate::core::prefs::ThemePref::Light,
+        }
+    }
 }
 
 /// 由调色板生成一套完整的 `egui::Style`。

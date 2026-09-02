@@ -4,6 +4,7 @@ pub mod dirscan;
 pub mod export;
 pub mod grepdir;
 pub mod indexer;
+pub mod prefs;
 pub mod recents;
 pub mod search;
 

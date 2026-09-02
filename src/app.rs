@@ -7,6 +7,7 @@ use regex::Regex;
 use crate::core::export::{ExportFormat, ExportMessage};
 use crate::core::grepdir::{GrepHit, GrepMessage, GrepOptions};
 use crate::core::indexer::{FileSet, IndexError, LogFileIndex};
+use crate::core::prefs::Prefs;
 use crate::core::recents::Recents;
 use crate::core::search::{
     CancelToken, SearchError, SearchHit, SearchMessage, SearchMode, SearchOptions,
@@ -103,6 +104,13 @@ pub struct AppState {
     /// 侧边栏当前高亮（已跳转）的文件索引；点击文件后置位并持久高亮，类似 VSCode 高亮已打开文件。
     pub sidebar_active_file: Option<usize>,
 
+    // —— 用户偏好持久化（spec §1.3 待定 P2，M17）——
+    /// 持久化偏好（主题/窗口几何/折行/侧栏/最近检索词）；实时开关 `wrap`/`show_sidebar`
+    /// 在保存时同步进本结构后写盘，加载时回填这两个实时字段。
+    pub prefs: Prefs,
+    /// 上次写偏好（窗口几何）的时刻（ctx.time，秒），节流到约每 2s 一次避免拖动时频繁写盘。
+    pub last_prefs_save: f64,
+
     // —— 外部文件修改检测（spec Q6）——
     /// 被外部修改/截断/轮转的文件路径列表（状态栏告警 + 「重新加载」依据），由 `logic` 节流检测。
     pub dirty_files: Vec<PathBuf>,
@@ -146,6 +154,17 @@ pub struct AppState {
     pub pending_grep_save: bool,
     /// toolbar 置位后，在 `ui` 中取消目录检索。
     pub pending_grep_stop: bool,
+}
+
+impl AppState {
+    /// 把当前实时偏好（主题/折行/侧栏/最近检索词/窗口几何）同步进自身 `prefs` 并写盘。
+    /// 主题等即时开关在切换处调用；窗口几何由 `logic()` 节流写盘。失败仅记日志，不打断用户。
+    pub fn save_prefs(&self) {
+        let mut p = self.prefs.clone();
+        p.wrap = self.wrap;
+        p.sidebar_visible = self.show_sidebar;
+        p.save();
+    }
 }
 
 pub struct LogViewerApp {
@@ -199,10 +218,14 @@ fn setup_fonts(ctx: &egui::Context) {
 }
 
 impl LogViewerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial_paths: Vec<std::path::PathBuf>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        initial_paths: Vec<std::path::PathBuf>,
+        prefs: Prefs,
+    ) -> Self {
         log::info!("Hyper Log starting up");
-        // 编辑器风格主题（默认暗色），再装字体：主题只改颜色，字体与主题互不影响。
-        theme::apply(&cc.egui_ctx);
+        // 编辑器风格主题（按持久化偏好，默认暗色），再装字体：主题只改颜色，字体与主题互不影响。
+        theme::apply(&cc.egui_ctx, prefs.theme.into());
         setup_fonts(&cc.egui_ctx);
         let show_perf = std::env::var("HYPER_LOG_PERF")
             .map(|v| v == "1")
@@ -214,6 +237,7 @@ impl LogViewerApp {
             state: AppState {
                 show_perf,
                 recents: Recents::load(),
+                prefs: prefs.clone(),
                 ..Default::default()
             },
             search_tx,
@@ -226,6 +250,9 @@ impl LogViewerApp {
             grep_rx,
             grep_cancel: None,
         };
+        // 回填实时开关（折行/侧栏）：持久化的是唯一真相，实时字段初值取自偏好。
+        app.state.wrap = app.state.prefs.wrap;
+        app.state.show_sidebar = app.state.prefs.sidebar_visible;
         // 启动即载入（命令行 `--open`/位置参数）：M16 为支撑实机观测与「终端秒开日志」而加。
         if !initial_paths.is_empty() {
             app.load_paths(initial_paths);
@@ -260,6 +287,7 @@ impl LogViewerApp {
         }
         if pressed(ctx, cmd, egui::Key::B) {
             self.state.show_sidebar = !self.state.show_sidebar;
+            self.state.save_prefs();
         }
         // ⌘G / ⌘↵：触发检索（等价「查找」按钮）
         if (pressed(ctx, cmd, egui::Key::G) || pressed(ctx, cmd, egui::Key::Enter))
@@ -417,6 +445,9 @@ impl LogViewerApp {
             self.state.status_text = "请先打开日志文件".to_owned();
             return;
         }
+        // 记录最近检索词（M17 偏好持久化），下次启动后可用于检索历史下拉。
+        self.state.prefs.push_recent_search(&pattern);
+        self.state.save_prefs();
 
         let options = SearchOptions {
             mode: self.state.search_mode,
@@ -730,6 +761,20 @@ impl eframe::App for LogViewerApp {
         // 仅后台有活动时才请求重绘，空闲时不烧 CPU（spec §8.4）。
         if self.state.is_searching || self.state.is_exporting || self.state.is_grepping {
             ctx.request_repaint();
+        }
+
+        // M17：窗口几何持久化（节流写盘，约每 2s 一次），下次启动恢复尺寸。
+        // 仅在尺寸确有变化时才写，避免每帧触盘；prefs 的其它字段（主题/折行/侧栏/最近检索词）
+        // 已由各自开关处即时保存，这里只更新 window 部分。
+        if let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()))
+            && ((size.x - self.state.prefs.window_w).abs() > 1.0
+                || (size.y - self.state.prefs.window_h).abs() > 1.0)
+            && now - self.state.last_prefs_save > 2.0
+        {
+            self.state.prefs.window_w = size.x;
+            self.state.prefs.window_h = size.y;
+            self.state.last_prefs_save = now;
+            self.state.prefs.save();
         }
 
         // 测量辅助（默认关闭）：HYPER_LOG_REPAINT=1 时强制每帧重绘，便于性能 HUD 在无人工
