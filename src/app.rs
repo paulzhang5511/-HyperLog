@@ -98,6 +98,8 @@ pub struct AppState {
     // —— 侧边栏目录树（spec §7.7 侧边栏）——
     /// 是否显示左侧文件目录树。
     pub show_sidebar: bool,
+    /// 侧边栏当前高亮（已跳转）的文件索引；点击文件后置位并持久高亮，类似 VSCode 高亮已打开文件。
+    pub sidebar_active_file: Option<usize>,
 
     // —— 行号跳转（spec §7.7 行跳转）——
     /// 行号跳转输入框的缓冲区（1-based 全局行号）。
