@@ -59,10 +59,8 @@ pub struct Palette {
     pub level_info: Color32,
     pub level_debug: Color32,
     pub level_trace: Color32,
-    /// 检索命中背景（荧光笔效果）。
+    /// 检索命中背景（荧光笔效果；文字保持正常色，确保高亮后内容仍清晰可读）。
     pub hit_bg: Color32,
-    /// 检索命中文字。
-    pub hit_fg: Color32,
 }
 
 /// 暗色（默认）：参照 VS Code Dark+。
@@ -87,8 +85,8 @@ pub const DARK: Palette = Palette {
     level_info: Color32::from_rgb(0x4F, 0xC1, 0xFF),
     level_debug: Color32::from_rgb(0x6A, 0x99, 0x55),
     level_trace: Color32::from_rgb(0x80, 0x80, 0x80),
-    hit_bg: Color32::from_rgb(0x5C, 0x4A, 0x16),
-    hit_fg: Color32::from_rgb(0xFF, 0xD8, 0x66),
+    // 暗色主题命中高亮：清晰的琥珀底色，文字沿用正常浅灰，对比充足。
+    hit_bg: Color32::from_rgb(0x53, 0x49, 0x12),
 };
 
 /// 亮色：参照 VS Code Light+。
@@ -113,8 +111,8 @@ pub const LIGHT: Palette = Palette {
     level_info: Color32::from_rgb(0x00, 0x5F, 0xA8),
     level_debug: Color32::from_rgb(0x23, 0x79, 0x93),
     level_trace: Color32::from_rgb(0x76, 0x76, 0x76),
-    hit_bg: Color32::from_rgb(0xFF, 0xE0, 0x80),
-    hit_fg: Color32::from_rgb(0x3A, 0x2B, 0x00),
+    // 亮色主题命中高亮：柔和的黄色荧光笔，文字沿用正常深灰，对比充足。
+    hit_bg: Color32::from_rgb(0xFF, 0xE8, 0x80),
 };
 
 /// 取当前主题对应的调色板（日志区自绘用）。

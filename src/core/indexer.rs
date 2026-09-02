@@ -242,6 +242,12 @@ impl FileSet {
         self.files.get(idx)
     }
 
+    /// 第 `file_idx` 个文件在全局行号空间中的起始行（0-based）；越界返回 `None`。
+    /// 供侧边栏目录树点击文件时跳转到该文件首行（spec §7.7 侧边栏）。
+    pub fn file_global_start(&self, file_idx: usize) -> Option<usize> {
+        self.cumulative.get(file_idx).copied()
+    }
+
     /// 已加载文件列表（只读），供检索引擎快照扫描（spec §7.3 / M4）。
     pub fn files(&self) -> &[Arc<LogFileIndex>] {
         &self.files

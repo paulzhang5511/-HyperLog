@@ -97,9 +97,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let mut clicked: Option<usize> = None;
     let mut copied: Option<String> = None;
 
-    egui::ScrollArea::both()
-        .auto_shrink([false; 2])
-        .show_rows(ui, row_h, total, |ui, range| {
+    let out = egui::ScrollArea::both().auto_shrink([false; 2]).show_rows(
+        ui,
+        row_h,
+        total,
+        |ui, range| {
             for row in range {
                 let (line, gutter_text) = row_content(state, row, in_result);
                 let text = truncate_for_render(&line);
@@ -148,7 +150,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     });
                 });
             }
-        });
+        },
+    );
+
+    // 行号跳转：消费 scroll_target，直接设置滚动区纵向偏移（行高固定 → row*row_h）。
+    // 行高固定是虚拟滚动 O(1) 定位的前提，故可用闭式偏移精确跳转（spec §7.2）。
+    if let Some(row) = state.scroll_target.take() {
+        let mut st = out.state;
+        let content_h = total as f32 * row_h;
+        let view_h = out.inner_rect.height().max(row_h);
+        let target = (row as f32 * row_h - view_h * 0.5).clamp(0.0, (content_h - view_h).max(0.0));
+        st.offset.y = target;
+        st.store(ui.ctx(), out.id);
+    }
 
     if let Some(r) = clicked {
         state.selected_row = Some(r);
@@ -228,8 +242,9 @@ fn build_job(line: &str, hl: &Highlighter, p: &Palette, wrap_width: f32) -> egui
             Segment::Plain(t) => (t, p.text, Color32::TRANSPARENT),
             Segment::Timestamp(t) => (t, p.timestamp, Color32::TRANSPARENT),
             Segment::Level(t, lvl) => (t, level_color(lvl, p), Color32::TRANSPARENT),
-            // 命中：荧光笔背景 + 高亮文字（编辑器查找命中的观感）
-            Segment::Hit(t) => (t, p.hit_fg, p.hit_bg),
+            // 命中：保持正常文字色，仅加背景高亮（VS Code 查找命中的观感），
+            // 避免低对比的「高亮文字」盖住内容导致看不清。
+            Segment::Hit(t) => (t, p.text, p.hit_bg),
         };
         job.append(
             text,

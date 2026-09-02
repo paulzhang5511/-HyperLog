@@ -124,7 +124,7 @@ pub fn run_grep(
 
         let display = display_path(&idx.path, options.base.as_deref());
         let remaining = options.max_hits.saturating_sub(total_hits);
-        let file_hits = search_one_file(&idx, &re, &display, remaining, &mut total_hits);
+        let file_hits = search_one_file(&idx, &re, &display, remaining, &mut total_hits, cancel);
 
         bytes_done += idx.byte_len() as u64;
         files_done += 1;
@@ -165,6 +165,7 @@ fn search_one_file(
     display: &str,
     limit: usize,
     total_hits: &mut usize,
+    cancel: &CancelToken,
 ) -> Vec<GrepHit> {
     let mut out = Vec::new();
     let n = idx.line_count();
@@ -174,6 +175,10 @@ fn search_one_file(
 
     let mut last_li: Option<usize> = None;
     'outer: for (lo, hi) in idx.chunk_bounds(8 * 1024 * 1024) {
+        // 块间检查取消令牌：大文件整扫时也能在数毫秒内响应「停止查找全部」（G1）。
+        if cancel.is_cancelled() {
+            break 'outer;
+        }
         let (bl, bh) = idx.byte_range(lo, hi);
         let slice = &idx.raw_bytes()[bl..bh];
         for m in re.find_iter(slice) {

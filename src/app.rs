@@ -11,7 +11,7 @@ use crate::core::recents::Recents;
 use crate::core::search::{
     CancelToken, SearchError, SearchHit, SearchMessage, SearchMode, SearchOptions,
 };
-use crate::ui::{log_view, results_view, status_bar, theme, toolbar};
+use crate::ui::{log_view, results_view, sidebar, status_bar, theme, toolbar};
 
 /// 每帧最多处理 1000 条后台消息，防止消息洪水饿死渲染（spec §8.4，对应 D6）。
 const MAX_MSG_PER_FRAME: usize = 1000;
@@ -94,6 +94,22 @@ pub struct AppState {
     frame_ms: Vec<f32>,
     /// 上一帧时间戳（秒，取自 `ctx.input().time`），用于计算帧间隔。
     last_frame_sec: f64,
+
+    // —— 侧边栏目录树（spec §7.7 侧边栏）——
+    /// 是否显示左侧文件目录树。
+    pub show_sidebar: bool,
+
+    // —— 行号跳转（spec §7.7 行跳转）——
+    /// 行号跳转输入框的缓冲区（1-based 全局行号）。
+    pub line_jump: String,
+    /// 待跳转到的全局行号（消费后清空）；`log_view` 据此滚动并高亮。
+    pub scroll_target: Option<usize>,
+
+    // —— 快捷键焦点请求 ——
+    /// 请求把焦点移到检索输入框（⌘F），由 `toolbar` 在下一帧落实。
+    pub focus_search: bool,
+    /// 请求把焦点移到行号跳转输入框（⌘L），由 `toolbar` 在下一帧落实。
+    pub focus_line_jump: bool,
 
     // —— 目录检索（"查找全部"）相关 ——
     /// 是否显示独立结果页（`true` 时中央区渲染结果而非日志正文）。
@@ -197,6 +213,51 @@ impl LogViewerApp {
             grep_tx,
             grep_rx,
             grep_cancel: None,
+        }
+    }
+
+    /// 全局快捷键（spec §7.7 常用快捷键）。
+    ///
+    /// 用 `consume_shortcut` 一次性消费，避免重复触发。`⌘O`/`⌘⇧O` 在检索中仍受 G1 禁用
+    /// （`pending_open`/`pending_open_dir` 的落实处已加 `!is_searching` 守卫）。
+    fn handle_shortcuts(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx();
+        let cmd = egui::Modifiers::COMMAND;
+        let cmd_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+
+        let pressed = |ctx: &egui::Context, m: egui::Modifiers, k: egui::Key| {
+            ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(m, k)))
+        };
+
+        if pressed(ctx, cmd, egui::Key::O) {
+            self.state.pending_open = true;
+        }
+        if pressed(ctx, cmd_shift, egui::Key::O) {
+            self.state.pending_open_dir = true;
+        }
+        if pressed(ctx, cmd, egui::Key::F) {
+            self.state.focus_search = true;
+        }
+        if pressed(ctx, cmd, egui::Key::L) {
+            self.state.focus_line_jump = true;
+        }
+        if pressed(ctx, cmd, egui::Key::B) {
+            self.state.show_sidebar = !self.state.show_sidebar;
+        }
+        // ⌘G / ⌘↵：触发检索（等价「查找」按钮）
+        if (pressed(ctx, cmd, egui::Key::G) || pressed(ctx, cmd, egui::Key::Enter))
+            && !self.state.is_searching
+            && !self.state.search_pattern.trim().is_empty()
+        {
+            self.state.pending_search = true;
+        }
+        // Esc：退出命中视图（返回全量日志）；否则清除选中行。
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.state.in_result_mode && !self.state.search_results.is_empty() {
+                self.state.in_result_mode = false;
+            } else {
+                self.state.selected_row = None;
+            }
         }
     }
 
@@ -621,6 +682,8 @@ impl eframe::App for LogViewerApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.handle_shortcuts(ui);
+
         if self.state.pending_search {
             self.state.pending_search = false;
             self.start_search();
@@ -702,6 +765,16 @@ impl eframe::App for LogViewerApp {
 
         toolbar::show(ui, &mut self.state);
         status_bar::show(ui, &self.state);
+        // 左侧文件目录树（可折叠）：点击文件跳转其首行。
+        if self.state.show_sidebar {
+            egui::Panel::left("sidebar_panel")
+                .resizable(true)
+                .default_size(240.0)
+                .frame(egui::Frame::default().fill(theme::palette(ui.ctx()).panel))
+                .show(ui, |ui| {
+                    sidebar::show(ui, &mut self.state);
+                });
+        }
         // 日志区用编辑器正文底色（与顶栏/底栏区分），且不留窗口内边距：
         // 行号槽要从最左侧开始，否则整块行背景会与正文错位。
         let bg = theme::palette(ui.ctx()).bg;

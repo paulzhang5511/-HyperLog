@@ -1,6 +1,15 @@
 use crate::app::AppState;
 use crate::core::search::SearchMode;
 
+/// 检索输入框的稳定 `Id`（⌘F 快捷键据此聚焦）。
+pub(crate) fn search_input_id() -> egui::Id {
+    egui::Id::new("search_pattern_input")
+}
+/// 行号跳转输入框的稳定 `Id`（⌘L 快捷键据此聚焦）。
+pub(crate) fn line_jump_input_id() -> egui::Id {
+    egui::Id::new("line_jump_input")
+}
+
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     egui::Panel::top("top_panel").show(ui, |ui| {
         // 窗口变窄时自动换行，而不是把控件挤出可视区
@@ -8,6 +17,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             // 应用名：弱化为一个标签，不与日志内容争夺注意力
             ui.label(egui::RichText::new("Hyper Log").strong());
             ui.separator();
+
+            // 侧边栏目录树开关（⌘B 也可切换）
+            ui.toggle_value(&mut state.show_sidebar, "☰")
+                .on_hover_text("文件目录树（⌘B）");
 
             // —— 文件组 ——（检索中禁用「打开」，G1）
             if ui
@@ -62,7 +75,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             ui.add_enabled_ui(!state.is_searching, |ui| {
                 let te = egui::TextEdit::singleline(&mut state.search_pattern)
                     .hint_text("查找…")
-                    .desired_width(220.0);
+                    .desired_width(220.0)
+                    .id(search_input_id());
                 ui.add(te);
 
                 egui::ComboBox::from_id_salt("search_mode")
@@ -134,6 +148,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             ui.separator();
 
             // —— 视图组 ——
+            // 行号跳转（⌘L 聚焦，回车跳转）：1-based 全局行号
+            ui.label("行:");
+            let line_resp = ui.add(
+                egui::TextEdit::singleline(&mut state.line_jump)
+                    .desired_width(56.0)
+                    .id(line_jump_input_id()),
+            );
+            if line_resp.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Tab))
+            {
+                apply_line_jump(state);
+            }
+
             // 折行开关：默认关，横向滚动（spec G7）
             let wrap_label = if state.wrap {
                 "折行: 开"
@@ -161,9 +188,36 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
 
+        // 快捷键焦点请求：⌘F / ⌘L 在下一帧把焦点移到对应输入框。
+        if state.focus_search {
+            state.focus_search = false;
+            ui.ctx().memory_mut(|m| m.request_focus(search_input_id()));
+        }
+        if state.focus_line_jump {
+            state.focus_line_jump = false;
+            ui.ctx()
+                .memory_mut(|m| m.request_focus(line_jump_input_id()));
+        }
+
         // 正则编译错误内联提示（不弹模态框，见 §7.5）
         if let Some(err) = &state.search_error {
             ui.label(egui::RichText::new(format!("检索错误：{err}")).color(egui::Color32::RED));
         }
     });
+}
+
+/// 解析「行:」输入框的 1-based 全局行号，越界则忽略（不报错）。
+fn apply_line_jump(state: &mut AppState) {
+    let total = state.fileset.total_lines();
+    if total == 0 {
+        return;
+    }
+    if let Ok(n) = state.line_jump.trim().parse::<usize>()
+        && n >= 1
+        && n <= total
+    {
+        let row = n - 1;
+        state.scroll_target = Some(row);
+        state.selected_row = Some(row);
+    }
 }

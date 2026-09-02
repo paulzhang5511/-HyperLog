@@ -435,15 +435,15 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
 ### 7.7 UI 布局
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ Hyper Log │ [打开][打开目录][最近文件▾] │ [查找…][模式▾][Aa][查找][查找全部] │ [折行][性能][☀] │
-├──────────────────────────────────────────────────────────────┤
-│   1 │ 2026-09-01 10:00:01.123  INFO  ... (虚拟滚动)          │
-│   2 │ 2026-09-01 10:00:01.456  ERROR ...                    │
-│ ... │ ...                                                  │
-├──────────────────────────────────────────────────────────────┤
-│ status │ 文件名 │ 索引 xx │ xx GB │ xx 行 │ xx 个文件 │ [行 123] │
-└──────────────────────────────────────────────────────────────┘
+┌──────────┬──────────────────────────────────────────────────────────────┐
+│ 目录树   │ Hyper Log │ [☰][打开][打开目录][最近文件▾] │ [查找…][模式▾][Aa][查找][查找全部] │ [行:___][折行][性能][☀] │
+│ ☰ 文件1  ├──────────────────────────────────────────────────────────────┤
+│ ▸ 子目录  │   1 │ 2026-09-01 10:00:01.123  INFO  ... (虚拟滚动)          │
+│   文件2   │   2 │ 2026-09-01 10:00:01.456  ERROR ...                    │
+│ ...      │ ... │ ...                                                  │
+│          ├──────────────────────────────────────────────────────────────┤
+│          │ status │ 文件名 │ 索引 xx │ xx GB │ xx 行 │ xx 个文件 │ [行 123] │
+└──────────┴──────────────────────────────────────────────────────────────┘
 ```
 
 - **编辑器观感**（Q7）：默认暗色主题（VS Code Dark+ 风格），`src/ui/theme.rs` 统一维护
@@ -455,6 +455,8 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
   分段合成一个 job），行背景与行号用 `Painter` 绘制，widget 数从 O(行×分段) 降到 O(行)（§8.4）。
 - `Wrap` 关闭时启用 `ScrollArea` 双向滚动，横向范围按「采样的最长行宽」固定（CJK 按 1.7 倍宽加权）；
   开启时行高统一按最长行的折行数放大（`MAX_WRAP_LINES` 封顶，P1 的 MVP 方案）。
+- **检索命中高亮**：命中段仅叠加荧光笔底色（`hit_bg`），文字沿用正常 `text` 色——保证高亮后
+  内容仍清晰可读（VS Code 风格），不再改文字色（早期版本同时改底色+文字色导致低对比、看不清）。
 - 检索中**不禁用**滚动区与"停止"按钮（G1）；仅禁用"打开文件""导出""搜索"自身。
 
 ### 7.7.1 打开目录（Q「打开目录」）
@@ -482,6 +484,38 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
 - 「保存结果…」弹保存对话框，把命中按「`路径:行号: 内容`」逐行写盘（复用
   `GrepHit` 内联文本，零回查）。
 - 「复制全部」复制所有命中到剪贴板；⌘C/Ctrl+C 复制选中行。
+
+### 7.7.4 侧边栏目录树（⌘B / ☰）
+
+- 左侧可折叠面板（`egui::Panel::left`，`app.rs` 中由 `state.show_sidebar` 控制显隐，
+  ⌘B 或工具栏 ☰ 切换），把当前 `FileSet` 的文件按磁盘路径构建成目录树：
+  目录用 `CollapsingHeader`（默认展开），文件用可点击行（文件名 + 行数弱色 + hover 全路径）。
+- 点击文件即跳转：把该文件在全局行号空间的首行（`FileSet::file_global_start(file_idx)`，
+  来自 `core::indexer.rs` 的 `cumulative` 累加表）写入 `state.scroll_target` 与
+  `state.selected_row`，由 `log_view` 滚动并高亮。从 `BTreeMap` 构建树保证目录顺序确定。
+
+### 7.7.5 行号跳转（⌘L）
+
+- 工具栏「行:」输入框（稳定 `Id = line_jump_input_id()`）接受 1-based 全局行号；
+  失焦或回车/Tab 时调用 `apply_line_jump`：解析越界则忽略（不报错）。
+- 跳转由 `log_view::show` 消费 `state.scroll_target` 落实：固定行高 `ROW_HEIGHT=18.0` →
+  目标偏移 `row*row_h - view_h*0.5`（居中），通过 `ScrollArea::show_rows` 返回的
+  `ScrollAreaOutput { id, state }` 用 `state.store(ctx, id)` 持久化纵向偏移。
+
+### 7.7.6 常用快捷键
+
+`app.rs::handle_shortcuts`（固有 `impl`，非 `eframe::App` trait 方法）用
+`ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(MODIFIERS, Key)))` 一次性消费：
+
+| 快捷键 | 作用 | 备注 |
+|--------|------|------|
+| ⌘O | 打开文件 | 检索中禁用（G1） |
+| ⌘⇧O | 打开目录 | 检索中禁用（G1） |
+| ⌘F | 聚焦检索框 | 下一帧 `request_focus(search_input_id())` |
+| ⌘L | 聚焦行号输入框 | 下一帧 `request_focus(line_jump_input_id())` |
+| ⌘G / ⌘↵ | 触发查找 | 等价「查找」按钮（非空模式且非检索中） |
+| ⌘B | 切换侧边栏 | `show_sidebar = !show_sidebar` |
+| Esc | 返回 | 命中视图→全量日志；否则清除选中行 |
 
 ### 7.8 `core::export` —— 流式导出（修复 D8 / G8）
 
@@ -836,6 +870,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | **M12a** | ✅ 完成 | `cff35e0`（内嵌 MiSans 中文字体 + 默认暗色主题） |
 | **M12b** | ✅ 完成 | 见 §14（编辑器风格 UI：主题/行号槽/单 widget 渲染/时间戳着色/顶底栏） |
 | **M13** | ✅ 完成 | 见 §14（打开目录 + 查找全部 + 独立结果页与保存） |
+| **M14** | ✅ 完成 | 见 §14（⌘快捷键 + 侧边栏目录树 + 行号跳转 + 高亮对比度修复 + 查找全部停止 bug 修复） |
 
 > 说明：M1/M2 合并于同一提交，因为 `core::indexer` 的 API 必须被 UI 消费后才不会触发
 > `clippy -D warnings` 的 dead_code 门禁，单独提交索引器会使 CI 在合并前变红。
@@ -884,3 +919,4 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-02 | M12a 字体与主题：egui 内置字体（Hack/Ubuntu-Light/NotoEmoji）均无 CJK 字形，中文渲染成豆腐块。`assets/fonts/MiSans-Normal.ttf` 经 `include_bytes!` 内嵌进二进制，作为兜底追加到 Proportional/Monospace 两族末尾（不替换主字体，拉丁字符仍由内置字体绘制、Monospace 保持等宽列对齐）。默认主题固定暗色（`theme_preference` 默认 System），工具栏加 ☀/🌙 切换。副作用：release 二进制 12M→19M | Agent |
 | 2026-09-02 | M12b 编辑器风格 UI：新增 `src/ui/theme.rs`（VS Code Dark+/Light+ 两套 `Style` + `Palette`，控件扁平化/紧凑间距/正文 12.5px）；`log_view.rs` 重写为行号槽 + 单 widget 渲染（每行 1 个 `Label` 承载多色 `LayoutJob`，行背景/行号用 `Painter` 绘制，widget 数 O(行×分段)→O(行)），hover 高亮、点击选中 + ⌘C 复制、右键复制，横向滚动范围按采样最长行宽（CJK 1.7 倍加权）固定；`highlight.rs` 新增 `Segment::Timestamp`（ISO/logcat/纯时间三形态正则）；顶栏分组弱化标题、底栏改分段信息（文件数·行数·体积·索引内存·选中行）。§7.7 重写，41 单测全绿 | Agent |
 | 2026-09-02 | M13 打开目录 + 查找全部 + 独立结果页：① 新增 `core::dirscan.rs`——递归收集目录树下 `.log/.txt/.out`（大小写不敏感），跳过隐藏条目与符号链接，按路径升序确定性返回；工具栏「打开目录」复用 `load_paths` 批量加载。② 新增 `core::grepdir.rs`——对目录逐文件建索引并做字节级检索（复用 `build_regex_bytes` + 分块 `find_iter`），流式回传 `GrepHit`（内联行文本 + 相对路径，因目录索引是临时的），复用 `CancelToken` 与 G6 截断语义。③ 新增 `ui/results_view.rs` 独立结果页（命中总数 + 保存/复制全部/返回日志 + 虚拟滚动列表「路径:行号 内容」），「保存结果」把命中按「路径:行号: 内容」写盘。④ AppState/app.rs 接线目录检索通道与结果页切换；工具栏「打开目录」「查找全部」「停止查找全部」。§7.7 增 7.7.1/7.7.2/7.7.3，新增 8 个单测（48 总），门禁全绿 | Agent |
+| 2026-09-03 | M14 五大体验增强（spec §7.7）：① **常用快捷键**——`app.rs::handle_shortcuts`（固有 impl，非 trait 方法）用 `consume_shortcut` 处理 ⌘O/⌘⇧O/⌘F/⌘L/⌘B/⌘G/⌘↵/Esc，焦点请求经 `toolbar` 下一帧 `request_focus(search_input_id()/line_jump_input_id())` 落实。② **侧边栏目录树**——新增 `ui/sidebar.rs`，由 `FileSet` 路径建 `BTreeMap` 树（`CollapsingHeader` + `selectable_label`），点击文件写 `state.scroll_target = FileSet::file_global_start(file_idx)`（新增 `core::indexer.rs::file_global_start`）；`app.rs` 用 `egui::Panel::left` 承载（⌘B 或 ☰ 切换）。③ **行号跳转**——工具栏「行:」输入经 `apply_line_jump` 解析 1-based 全局行号，`log_view` 消费 `scroll_target` 用 `ScrollAreaOutput.state.store` 居中滚动（固定行高 18px）。④ **高亮对比度修复**——`Segment::Hit` 改为文字沿用正常 `text` 色、仅叠 `hit_bg` 荧光底色（VS Code 风格），调亮两套 `hit_bg`。⑤ **查找全部停止 bug 修复**——`grepdir::search_one_file` 在分块循环**块间**新增 `cancel.is_cancelled()` 检查（原仅文件间检查，大文件整扫时「停止」无效，违反 G1）。§7.7 增 7.7.4/7.7.5/7.7.6 并补命中高亮说明，§12.1 增 M14。门禁 clippy(-D warnings)/fmt/48 单测/发布烟测均绿 | Agent |
