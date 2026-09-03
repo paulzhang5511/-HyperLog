@@ -346,12 +346,18 @@ impl LogViewerApp {
 
     /// 加载一批路径：文件对话框与「最近文件」共用同一套校验与提示逻辑（M11）。
     ///
-    /// 成功加载的路径会记入最近文件列表并立即落盘。沿用「打开」的既有语义：
-    /// 新文件是**追加**到当前文件集合，而非替换（MVP 未提供关闭单个文件的能力）。
+    /// 语义为**替换**而非追加：打开新文件即切换当前文档，与编辑器「打开文件」一致
+    /// （早期版本是追加，导致打开第二个文件后视口仍停在第一个文件的内容上，像是没刷新）。
+    ///
+    /// 先把新文件全部打开成功再整体替换，避免中途失败时旧文件已被清空、又没有新文件可显示。
+    /// 若一个都没打开成功，则保留原集合不动，只报告错误。
     fn load_paths(&mut self, paths: Vec<PathBuf>) {
         let mut loaded = 0usize;
         let mut skipped = 0usize;
         let mut errors: Vec<String> = Vec::new();
+        // 新集合先攒在临时 Vec 里，全部成功后再接管 `fileset`。
+        let mut opened: Vec<Arc<LogFileIndex>> = Vec::new();
+        let mut bytes_total: u64 = 0;
 
         for path in paths {
             let bytes = match std::fs::metadata(&path).map(|m| m.len()) {
@@ -362,7 +368,8 @@ impl LogViewerApp {
                     continue;
                 }
             };
-            if self.state.fileset.total_bytes() as u64 + bytes > 32 * 1024 * 1024 * 1024 {
+            // 替换语义：上限只针对本次打开的新集合，不含即将被替换掉的旧文件。
+            if bytes_total + bytes > 32 * 1024 * 1024 * 1024 {
                 skipped += 1;
                 errors.push(format!(
                     "{}: 累计超过 {} 上限，已跳过",
@@ -374,7 +381,8 @@ impl LogViewerApp {
 
             match LogFileIndex::open(&path) {
                 Ok(idx) => {
-                    self.state.fileset.push(Arc::new(idx));
+                    bytes_total += bytes;
+                    opened.push(Arc::new(idx));
                     // 只有真正成功打开才记入最近文件（M11）。
                     self.state.recents.push(path.clone());
                     loaded += 1;
@@ -392,12 +400,39 @@ impl LogViewerApp {
 
         if loaded > 0 {
             self.state.recents.save();
+        } else {
+            // 一个都没打开成功：保留原有内容，仅提示错误。
+            let tail = errors.join("；");
+            self.state.status_text = if errors.is_empty() {
+                "未选择文件".to_owned()
+            } else {
+                format!("未加载任何文件（跳过 {skipped}）；{tail}")
+            };
+            log::warn!("{}", self.state.status_text);
+            return;
         }
 
-        // 新文件可能比已加载的更宽，重新估算横向滚动范围；行号语义也随之变化，清掉选中行。
+        // —— 整体替换当前文档 ——
+        self.state.fileset.clear();
+        for idx in opened {
+            self.state.fileset.push(idx);
+        }
+
+        // 文档已换：旧的检索坐标按 file_idx 索引，指向的已不是同一批文件，必须清空；
+        // 选中行 / 跳转目标 / 侧边栏高亮 / 脏标记同样失效。
+        self.state.search_results.clear();
+        self.state.search_truncated = false;
+        self.state.search_error = None;
+        self.state.hit_regex = None;
+        self.state.in_result_mode = false;
+        self.state.selected_row = None;
+        self.state.scroll_target = None;
+        self.state.sidebar_active_file = None;
+        self.state.dirty_files.clear();
+
+        // 新文件可能比已加载的更宽，重新估算横向滚动范围。
         let max_line_width = log_view::estimate_content_width(&self.state.fileset);
         self.state.max_line_width = max_line_width;
-        self.state.selected_row = None;
 
         let total = self.state.fileset.total_lines();
         let size = crate::util::human_bytes(self.state.fileset.total_bytes() as u64);

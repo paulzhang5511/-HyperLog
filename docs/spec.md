@@ -459,6 +459,17 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
   内容仍清晰可读（VS Code 风格），不再改文字色（早期版本同时改底色+文字色导致低对比、看不清）。
 - 检索中**不禁用**滚动区与"停止"按钮（G1）；仅禁用"打开文件""导出""搜索"自身。
 
+### 7.7.0 打开文件的语义：替换（非追加）
+
+- 工具栏「打开」（⌘O）、「最近文件」、「打开目录」统一走 `App::load_paths`，语义为**替换**：
+  先把本次选中的文件全部打开成功，再整体接管 `fileset`，旧集合丢弃（与编辑器「打开文件」一致）。
+- 早期版本为**追加**，导致打开第二个文件后视口仍停在第一个文件的内容上，表现为"内容不更新"。
+- 失败处理：先把新文件攒在临时 `Vec` 里，**全部失败则保留原有内容不动**、只在状态栏报错，
+  避免"旧的已清空、新的又没打开成功"的空窗；部分成功则替换并显示已跳过的原因。
+- 累计 32 GiB 上限在替换语义下只针对**本次新集合**统计，不含即将被替换掉的旧文件。
+- 文档被替换后，下列按 `file_idx` / 全局行号索引的状态一并清空：检索结果 `search_results`、
+  命中高亮正则 `hit_regex`、结果视图开关、选中行、跳转目标、侧边栏高亮、外部修改脏标记。
+
 ### 7.7.1 打开目录（Q「打开目录」）
 
 - `core::dirscan::collect_log_files(root)` 递归收集目录树下的日志文件（`.log`/`.txt`/`.out`，
@@ -947,3 +958,4 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-03 | M15 Q6 外部文件修改检测（spec §7.7 / §13）：`core::indexer.rs::FileSet` 新增 `opened_len`/`opened_mtime`（open 时记录）与纯函数 `detect_dirty`（节流 ~1s 比对 mtime/体积，与 ctx 解耦可单测）；`app.rs::logic()` 轮询写 `state.dirty_files`，`ui()` 在 `pending_reload` 时调 `reload_all()`（清空旧索引重开，不触碰 mmap，规避 macOS truncate 致 SIGBUS 的 D15）；`ui/status_bar.rs` 改签名 `show(ui, state)`，脏文件非空时渲染琥珀色「N 个文件被外部修改」+「重新加载」按钮。`app.rs` 新增 `sidebar_active_file`、`dirty_files`/`last_dirty_check`/`pending_reload` 字段。新增 `detect_dirty_flags_external_modification` 单测（50 总）。Q2(Linux) 明确 MVP 不含，目标平台仅 macOS + Windows 11；§13 表 Q6 行改「已落地状态栏提示 + 重新加载」、§13.1 补 Q6 由 M15 落地结论。门禁 fmt/clippy(-D warnings)/50 单测/发布构建均绿 | Agent |
 | 2026-09-03 | M16 GUI 验收首轮观测（P4/P5/P6/P12）+ 观测开关：① 启动即载入 `main.rs` 解析 `-o/--open <path>` 与位置参数，`app.rs::new` 收集后调 `load_paths`（终端秒开 + 自动化观测）；② `app.rs::logic` 新增默认关的测量辅助 `HYPER_LOG_REPAINT=1`（强制每帧重绘，无交互也可稳定采样）；③ 性能 HUD（`show_perf` 块）新增 `HYPER_LOG_PERF_LOG=1`：每 ~1s 把 `fps/p95/峰值/帧数` 打到 stderr，`AppState` 加 `perf_log_last_sec` 节流。无头实测（xlarge.log 1.2GB + 三开关）：稳态 fps≈60、p95≈21ms、峰值≈21ms（21ms 为无 GPU 软件渲染抖动）；据此 **P6 ✅（峰值 21ms ≪ 50ms 即便软件渲染）**、**P5 ✅（1.2GB 帧耗时与规模无关，虚拟滚动常量开销）**，P4 avg 60fps 但 p95 受软件渲染抬到 21ms（真机 GPU 受 vsync 限 ~16.6ms 预期达标，需真机 HUD 复测），P12 无头沙箱 `ps`/`top` 无 CPU 记账权限无法读数（§8.4 设计保证，需真机活动监视器确认）。无头窗口未注册进窗口服务器，故 HUD 截图不可行，改用 stderr 日志量化。§11.2.1 补 P4/P5/P6/P12 实测行、§12.1 增 M16、§14 本行记录。门禁 fmt/clippy(-D warnings)/50 单测/发布构建均绿 | Agent |
 | 2026-09-03 | M17 用户偏好持久化（spec §1.3 待定 P2「序列化（配置）」）：① 新增 `src/core/prefs.rs`——零新增依赖，`key=value` 容错解析（未知键/非法值/损坏行/空 recent 安全忽略，绝不 panic）、tmp/rename 原子写盘、最近检索词去重最近优先上限 10；自有 `ThemePref{Dark,Light}` 枚举（核心层禁止依赖 `egui`，在 `ui/theme.rs` 用双向 `From` 映射到 `egui::Theme`）；存储位置 macOS `~/Library/Application Support/hyper-log/prefs.txt`、Windows `%APPDATA%\hyper-log\`、其它 `~/.config/hyper-log/`。② `AppState` 增 `prefs`/`last_prefs_save` 与 `save_prefs()`（同步实时 `wrap`/`show_sidebar` 后写盘）；`main.rs` 启动 `Prefs::load()` 并经 `LogViewerApp::new(cc, initial_paths, prefs)` 注入，`viewport` 用持久化窗口尺寸；`theme.rs::apply` 改收 `theme` 参数。③ 即时保存：工具栏「☰侧栏」/「折行」/主题 ☀🌙 切换、⌘B、检索提交（记最近检索词）均调 `save_prefs`；`logic()` 节流（尺寸确变且距上次 >2s）写窗口几何。沿用 M11 的 `std::fs` 纯文本思路，不引入 eframe `persistence`（需 `serde`+`ron`），故 Q3 当初推迟理由不变。§1.3 序列化（配置）待定→已落地 M17、§12.1 增 M17、§14 本行记录。门禁 fmt/clippy(-D warnings)/54 单测（含 4 个新 prefs 单测）/8 ignored/发布构建/窗口冒烟 ALIVE 均绿 | Agent |
+| 2026-09-03 | 修复①**打开第二个文件内容不更新**：`app.rs::load_paths` 语义由「追加」改为「替换」——先把新文件全部打开成功攒在临时 `Vec`，再整体接管 `fileset`；全部失败则保留原内容只报错，避免空窗；累计 32 GiB 上限改为只统计本次新集合；文档替换后清空 `search_results`/`hit_regex`/结果视图开关/选中行/`scroll_target`/侧边栏高亮/脏标记（这些按 `file_idx` 索引，指向已不是同一批文件）。新增 §7.7.0 固化该契约。修复②**双击选中行致文字看不清**：根因是日志语义色（时间戳/级别）铺在「选中行 `row_active`」与双击触发的「文字选区 `selection`」底色上对比度骤降——亮色时间戳在 `selection` 上仅 **1.88:1**、暗色 2.15:1，近乎隐形。调整两套 `Palette` 的 `timestamp`/`level_error`/`level_warn`/`level_debug`/`level_trace`（亮色整体压暗、暗色整体提亮），使 7 个前景色在 `bg`/`row_hover`/`row_active`/`selection` 四种底色上均 ≥3.0:1、正文 ≥4.5:1；`selection` 与 `row_active` 底色保持不变。回归守卫：`ui/theme.rs` 新增 2 个用例 `log_text_colors_stay_readable`（7 前景 × 4 底色 × 2 主题全矩阵）与 `hit_highlight_background_keeps_text_readable`，按 WCAG 2.1 计算对比度；已反向验证能捕获修复前取值。门禁 fmt/clippy(-D warnings)/58 单测全绿 | Agent |

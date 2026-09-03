@@ -89,12 +89,15 @@ pub const DARK: Palette = Palette {
     accent: Color32::from_rgb(0x0E, 0x63, 0x9C),
     selection: Color32::from_rgb(0x26, 0x4F, 0x78),
 
-    timestamp: Color32::from_rgb(0x80, 0x80, 0x80),
-    level_error: Color32::from_rgb(0xF1, 0x4C, 0x4C),
+    // 语义色须同时能在「普通背景 / 行悬停 / 选中行 / 文字选区」四种底色上读清：
+    // 双击会触发 egui 的文字选区（铺 `selection` 底色），此前时间戳在其上仅 1.88:1 近乎隐形。
+    // 下列取值经 `log_text_colors_stay_readable` 用例校验，四种底色下均 ≥ 3.0:1。
+    timestamp: Color32::from_rgb(0x9C, 0x9C, 0x9C),
+    level_error: Color32::from_rgb(0xF4, 0x73, 0x73),
     level_warn: Color32::from_rgb(0xD7, 0xBA, 0x7D),
     level_info: Color32::from_rgb(0x4F, 0xC1, 0xFF),
-    level_debug: Color32::from_rgb(0x6A, 0x99, 0x55),
-    level_trace: Color32::from_rgb(0x80, 0x80, 0x80),
+    level_debug: Color32::from_rgb(0x82, 0xAC, 0x6E),
+    level_trace: Color32::from_rgb(0x9C, 0x9C, 0x9C),
     // 暗色主题命中高亮：清晰的琥珀底色，文字沿用正常浅灰，对比充足。
     hit_bg: Color32::from_rgb(0x53, 0x49, 0x12),
 };
@@ -117,12 +120,13 @@ pub const LIGHT: Palette = Palette {
     accent: Color32::from_rgb(0x00, 0x7A, 0xCC),
     selection: Color32::from_rgb(0xAD, 0xD6, 0xFF),
 
-    timestamp: Color32::from_rgb(0x99, 0x99, 0x99),
+    // 同暗色：四种底色下均需 ≥ 3.0:1（见 `log_text_colors_stay_readable`）。
+    timestamp: Color32::from_rgb(0x74, 0x74, 0x74),
     level_error: Color32::from_rgb(0xC5, 0x1E, 0x1E),
-    level_warn: Color32::from_rgb(0xA0, 0x73, 0x00),
+    level_warn: Color32::from_rgb(0x96, 0x6C, 0x00),
     level_info: Color32::from_rgb(0x00, 0x5F, 0xA8),
     level_debug: Color32::from_rgb(0x23, 0x79, 0x93),
-    level_trace: Color32::from_rgb(0x76, 0x76, 0x76),
+    level_trace: Color32::from_rgb(0x6E, 0x6E, 0x6E),
     // 亮色主题命中高亮：柔和的黄色荧光笔，文字沿用正常深灰，对比充足。
     hit_bg: Color32::from_rgb(0xFF, 0xE8, 0x80),
 };
@@ -342,5 +346,55 @@ mod tests {
     fn text_strong_differs_from_text() {
         assert_ne!(DARK.text_strong, DARK.text);
         assert_ne!(LIGHT.text_strong, LIGHT.text);
+    }
+
+    /// 日志正文的所有语义色，在四种行底色上都必须保持可读。
+    ///
+    /// 回归守卫：日志行的文字色（正文/时间戳/各级级别）会铺在四种底色之上——
+    /// 普通背景 `bg`、悬停 `row_hover`、**选中行 `row_active`**、以及双击触发的
+    /// **文字选区 `selection`**（egui 的 `Label::selectable` 双击选词后铺 `selection` 底色）。
+    /// 此前时间戳在亮色选区上仅 1.88:1、暗色选区上 2.15:1，双击后几乎看不见。
+    /// 这里锁住：正文 ≥ 4.5:1，语义色（刻意弱化的时间戳/级别）≥ 3.0:1。
+    #[test]
+    fn log_text_colors_stay_readable() {
+        for p in [&DARK, &LIGHT] {
+            let backgrounds = [
+                ("bg", p.bg),
+                ("row_hover", p.row_hover),
+                ("row_active", p.row_active),
+                ("selection", p.selection),
+            ];
+            // （名称，前景色，对比度下限）
+            let foregrounds: [(&str, Color32, f32); 7] = [
+                ("text", p.text, 4.5),
+                ("timestamp", p.timestamp, 3.0),
+                ("level_error", p.level_error, 3.0),
+                ("level_warn", p.level_warn, 3.0),
+                ("level_info", p.level_info, 3.0),
+                ("level_debug", p.level_debug, 3.0),
+                ("level_trace", p.level_trace, 3.0),
+            ];
+            for (fg_name, fg, min) in foregrounds {
+                for (bg_name, bg) in backgrounds {
+                    let ratio = contrast(fg, bg);
+                    assert!(
+                        ratio >= min,
+                        "{fg_name} 在 {bg_name} 上对比度仅 {ratio:.2}:1，低于下限 {min}:1"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 命中高亮背景上的正文必须可读（`Segment::Hit` 只叠底色、不改文字色）。
+    #[test]
+    fn hit_highlight_background_keeps_text_readable() {
+        for p in [&DARK, &LIGHT] {
+            let ratio = contrast(p.text, p.hit_bg);
+            assert!(
+                ratio >= 4.5,
+                "正文在命中高亮底色上对比度仅 {ratio:.2}:1，低于下限 4.5:1"
+            );
+        }
     }
 }
