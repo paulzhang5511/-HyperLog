@@ -1,0 +1,60 @@
+name: Release
+
+# 推送 v* 标签时构建 release 二进制并上传到 GitHub Release（附带打包产物）。
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: macos
+            asset_path: dist/HyperLog-macos.zip
+            asset_name: HyperLog-macos.zip
+          - os: windows-latest
+            target: windows
+            asset_path: dist/hyper-log-windows.zip
+            asset_name: hyper-log-windows.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Package (macOS)
+        if: matrix.target == 'macos'
+        run: bash scripts/package_macos.sh
+
+      - name: Package (Windows)
+        if: matrix.target == 'windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/hyper-log.exe dist/
+          ( cd dist && rm -f hyper-log-windows.zip && zip -r hyper-log-windows.zip hyper-log.exe )
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset_path }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

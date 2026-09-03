@@ -983,17 +983,34 @@ impl eframe::App for LogViewerApp {
                 log_view::show(ui, &mut self.state);
             });
 
-        // 目录检索结果：底部面板（notepad++ 风格），正文日志区保留在上方；
-        // 点击命中行跳转原文对应行，面板保持打开以便连续跳转，「返回日志」按钮关闭。
-        if self.state.show_results {
-            egui::Panel::bottom("grep_results_panel")
-                .resizable(true)
-                .default_size(220.0)
-                .frame(egui::Frame::default().fill(theme::palette(ui.ctx()).panel))
-                .show(ui, |ui| {
-                    results_view::show(ui, &mut self.state);
-                });
-        }
+        // 目录检索结果：独立浮动窗口（notepad++ 风格），不再挤压正文日志区布局。
+        // 可自由拖动、可缩放、可折叠、可关闭；点击命中行跳转原文，窗口保持打开以便连续跳转。
+        // `.open(&mut self.state.show_results)` 让窗口右上角 ✕ 与「返回日志」按钮
+        // 都作用到同一个状态，关闭后窗口即消失。
+        //
+        // 定位：不用 `.anchor`（它会在窗口每次从关闭重开时强制拉回锚点，表现为「固定不可移动」），
+        // 改用 `.default_pos` 仅**首次出现**时定位到底部居中，此后完全由用户拖动决定、egui 记忆。
+        // 宽度：取主窗口内矩形的 80%（下限 400px 兜底超窄窗口），首次出现时生效。
+        let mut open = self.state.show_results;
+        let screen = ui.ctx().input(|i| i.content_rect());
+        let target_w = (screen.width() * 0.8).max(400.0);
+        let target_pos = egui::pos2(
+            screen.left() + (screen.width() - target_w) / 2.0,
+            screen.bottom() - 228.0, // 高度 220 + 底部留白 8
+        );
+        egui::Window::new("查找结果")
+            .id(egui::Id::new("grep_results_window"))
+            .open(&mut open)
+            .movable(true)
+            .resizable(true)
+            .collapsible(true)
+            .default_width(target_w)
+            .default_height(220.0)
+            .default_pos(target_pos)
+            .show(ui.ctx(), |ui| {
+                results_view::show(ui, &mut self.state);
+            });
+        self.state.show_results = open;
 
         // 性能 HUD（spec P4/P5/P6 可观测化）：仅在开启时绘制，且不主动请求重绘，
         // 避免拉高空闲 CPU（P12）。窗口内容仅在产生新帧时（滚动/检索）刷新。

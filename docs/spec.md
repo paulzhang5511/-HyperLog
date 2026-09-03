@@ -487,17 +487,24 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
 - 工具栏「查找全部」弹目录选择框，选中后启动后台检索；进行中显示「停止查找全部」。
 - 与单文件检索（`start_search`）互斥：目录检索运行期间禁用普通检索。
 
-### 7.7.3 底部结果面板（Q「结果单独页面/保存」）
+### 7.7.3 结果浮动窗口（Q「结果单独页面/保存」）
 
-- 目录检索完成后在**底部弹出结果面板**（`egui::Panel::bottom`，`ui/results_view.rs`），
-  **正文日志区保留在上方**（notepad++ 风格，不再是中央区全屏替换）：
+- 目录检索完成后弹出**独立浮动窗口**「查找结果」（`egui::Window`，`app.rs` 中 `id =
+  "grep_results_window"`，`ui/results_view.rs` 渲染内容），**不挤压正文日志区布局**
+  （notepad++ 风格）：可拖动、可改变大小、可折叠，右上角 ✕ 关闭。
+  **定位不用 `.anchor`**（它会在窗口每次从关闭重开时强制拉回锚点，表现为「固定不可移动」），
+  改用 `.default_pos` 仅**首次出现**时定位到底部居中，此后位置/尺寸完全由用户拖动决定、egui 记忆。
+  **宽度取主窗口内容矩形的 80%**（下限 400px 兜底超窄窗口），`default_width` 首次出现时生效。
   顶部是结果页头（命中总数 + 截断提示 + 「保存结果…」「复制全部」「返回日志」），
   下方是虚拟滚动的命中列表，每行「`文件路径:行号` + 内容」（路径用主题强调色、行号弱化）。
+- **窗口关闭状态同步**：`.open(&mut show_results)` 让 ✕ 与「返回日志」按钮都作用到
+  同一个 `state.show_results` 状态——二者任一关闭后窗口即消失（早期 `Panel::bottom` 版本
+  的关闭按钮无法真正关闭，因为面板显隐只受 `show_results` 单向控制）。
 - **点击命中行 → 跳转原文对应行**（notepad++ 风格）：`GrepHit` 除展示路径 `display_path` 外
   还内联**绝对路径 `abs_path`**；点击时置 `pending_grep_jump = (abs_path, 行号)`，由 `app.rs::ui`
   落实——若目标文件已在 `FileSet` 则按 `file_global_start + 行号` 直接定位，否则 `load_paths`
   打开它（替换语义）再定位；正文滚动到该行并高亮（`scroll_target` + `selected_row`）。
-  结果面板**保持打开**以便连续跳转，仅「返回日志」按钮显式关闭。
+  结果窗口**保持打开**以便连续跳转，仅「返回日志」按钮或 ✕ 显式关闭。
 - 「保存结果…」弹保存对话框，把命中按「`路径:行号: 内容`」逐行写盘（复用
   `GrepHit` 内联文本，零回查）。
 - 「复制全部」复制所有命中到剪贴板；⌘C/Ctrl+C 复制选中行。
@@ -966,3 +973,5 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-03 | M17 用户偏好持久化（spec §1.3 待定 P2「序列化（配置）」）：① 新增 `src/core/prefs.rs`——零新增依赖，`key=value` 容错解析（未知键/非法值/损坏行/空 recent 安全忽略，绝不 panic）、tmp/rename 原子写盘、最近检索词去重最近优先上限 10；自有 `ThemePref{Dark,Light}` 枚举（核心层禁止依赖 `egui`，在 `ui/theme.rs` 用双向 `From` 映射到 `egui::Theme`）；存储位置 macOS `~/Library/Application Support/hyper-log/prefs.txt`、Windows `%APPDATA%\hyper-log\`、其它 `~/.config/hyper-log/`。② `AppState` 增 `prefs`/`last_prefs_save` 与 `save_prefs()`（同步实时 `wrap`/`show_sidebar` 后写盘）；`main.rs` 启动 `Prefs::load()` 并经 `LogViewerApp::new(cc, initial_paths, prefs)` 注入，`viewport` 用持久化窗口尺寸；`theme.rs::apply` 改收 `theme` 参数。③ 即时保存：工具栏「☰侧栏」/「折行」/主题 ☀🌙 切换、⌘B、检索提交（记最近检索词）均调 `save_prefs`；`logic()` 节流（尺寸确变且距上次 >2s）写窗口几何。沿用 M11 的 `std::fs` 纯文本思路，不引入 eframe `persistence`（需 `serde`+`ron`），故 Q3 当初推迟理由不变。§1.3 序列化（配置）待定→已落地 M17、§12.1 增 M17、§14 本行记录。门禁 fmt/clippy(-D warnings)/54 单测（含 4 个新 prefs 单测）/8 ignored/发布构建/窗口冒烟 ALIVE 均绿 | Agent |
 | 2026-09-03 | 修复①**打开第二个文件内容不更新**：`app.rs::load_paths` 语义由「追加」改为「替换」——先把新文件全部打开成功攒在临时 `Vec`，再整体接管 `fileset`；全部失败则保留原内容只报错，避免空窗；累计 32 GiB 上限改为只统计本次新集合；文档替换后清空 `search_results`/`hit_regex`/结果视图开关/选中行/`scroll_target`/侧边栏高亮/脏标记（这些按 `file_idx` 索引，指向已不是同一批文件）。新增 §7.7.0 固化该契约。修复②**双击选中行致文字看不清**：根因是日志语义色（时间戳/级别）铺在「选中行 `row_active`」与双击触发的「文字选区 `selection`」底色上对比度骤降——亮色时间戳在 `selection` 上仅 **1.88:1**、暗色 2.15:1，近乎隐形。调整两套 `Palette` 的 `timestamp`/`level_error`/`level_warn`/`level_debug`/`level_trace`（亮色整体压暗、暗色整体提亮），使 7 个前景色在 `bg`/`row_hover`/`row_active`/`selection` 四种底色上均 ≥3.0:1、正文 ≥4.5:1；`selection` 与 `row_active` 底色保持不变。回归守卫：`ui/theme.rs` 新增 2 个用例 `log_text_colors_stay_readable`（7 前景 × 4 底色 × 2 主题全矩阵）与 `hit_highlight_background_keeps_text_readable`，按 WCAG 2.1 计算对比度；已反向验证能捕获修复前取值。门禁 fmt/clippy(-D warnings)/58 单测全绿 | Agent |
 | 2026-09-03 | 「查找全部」结果交互对齐 notepad++：① `GrepHit` 新增内联**绝对路径 `abs_path: PathBuf`**（保留 `display_path` 展示用），`search_one_file` 构造时填 `idx.path`；② 结果页由「中央区全屏替换」改为**底部结果面板**（`egui::Panel::bottom`，正文日志区保留在上方），面板 `resizable` 默认高 220px；③ **点击命中行 → 跳转原文对应行**：置 `pending_grep_jump=(abs_path, 行号)`，`app.rs::jump_to_grep_hit` 落实——目标文件已在 `FileSet` 则按 `file_global_start + 行号` 定位，否则 `load_paths` 打开（替换语义）再定位，正文 `scroll_target`+`selected_row` 滚动并高亮该行，同时高亮侧边栏对应文件；结果面板**保持打开**以便连续跳转，仅「返回日志」显式关闭。§7.7.3 标题「独立结果页」改「底部结果面板」并补跳转契约。新增 `grepdir` 单测断言 `abs_path` 为绝对且存在的路径。门禁 fmt/clippy(-D warnings)/58 单测/release 构建/窗口冒烟 ALIVE 均绿 | Agent |
+| 2026-09-04 | 查找结果「面板」改「浮动窗口」：① `app.rs` 把 `Panel::bottom("grep_results_panel")` 改为 `egui::Window::new("查找结果").id(Id::new("grep_results_window"))`，不挤压正文布局；`.open(&mut show_results)` 让窗口 ✕ 与「返回日志」按钮共同作用到同一状态（`Panel::bottom` 版本关闭按钮无法真正关闭）。② **可移动 + 宽度 80%**：定位不用 `.anchor`（会在每次从关闭重开时强制拉回锚点，表现为「固定不可移动」），改用 `.default_pos` 仅首次定位底部居中 + `.movable(true)`；宽度取 `ctx.input(|i| i.content_rect()).width() * 0.8`（下限 400px）。③ **egui 0.36 API 坑**：`Context::screen_rect()` 已移除、`InputState` 也无 `screen_rect`，取视口矩形用 `i.content_rect()`（= viewport_rect 去掉安全区）或 `i.viewport_rect()`。§7.7.3 由「底部结果面板」改写为「结果浮动窗口」。门禁 fmt/clippy(-D warnings)/58 单测/release 构建/窗口冒烟 ALIVE 均绿 | Agent |
+| 2026-09-04 | 发布 0.0.3：① **README 重写**为使用者视角（下载安装/从源码构建/使用说明/快捷键/平台支持/已知限制）；② 新增 `.github/workflows/release.yml`——推送 `v*` tag 时构建 release 二进制（macOS 复用 `scripts/package_macos.sh` 产 `.app`+zip、Windows 产 `hyper-log.exe`+zip）并用 `softprops/action-gh-release@v2` 上传到 GitHub Release 附带二进制；③ 版本号 `Cargo.toml`/`Cargo.lock`/`docs/prd.md` 0.0.2→0.0.3 | Agent |

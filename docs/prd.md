@@ -69,7 +69,7 @@ hyper_log/
 ```toml
 [package]
 name = "hyper_log"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 
 [dependencies]
