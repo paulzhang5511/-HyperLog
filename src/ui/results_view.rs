@@ -110,10 +110,16 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 let resp = ui.add(egui::Label::new(job).selectable(true));
                 if resp.clicked() {
                     state.grep_selected_row = Some(row);
+                    // 单击命中 → 跳转原文对应行（notepad++ 风格）：打开目标文件并定位。
+                    state.pending_grep_jump = Some((hit.abs_path.clone(), hit.line_number));
                 }
                 resp.context_menu(|ui| {
                     if ui.button("复制此行").clicked() {
                         copied = Some(hit.line.clone());
+                        ui.close();
+                    }
+                    if ui.button("跳转到原文").clicked() {
+                        state.pending_grep_jump = Some((hit.abs_path.clone(), hit.line_number));
                         ui.close();
                     }
                 });

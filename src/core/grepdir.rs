@@ -25,6 +25,8 @@ use crate::core::search::{CancelToken, SearchOptions, build_regex_bytes};
 pub struct GrepHit {
     /// 相对根目录的展示路径（或文件名，见 [`GrepOptions::base`]）。
     pub display_path: String,
+    /// 命中文件的绝对路径（点击结果跳转原文时据此打开并定位）。
+    pub abs_path: PathBuf,
     /// 文件内行号（1-based，符合编辑器习惯）。
     pub line_number: usize,
     /// 该行文本（lossy）。
@@ -192,6 +194,7 @@ fn search_one_file(
                 if let Some(line) = idx.line(li) {
                     out.push(GrepHit {
                         display_path: display.to_owned(),
+                        abs_path: idx.path.clone(),
                         line_number: li + 1,
                         line: line.into_owned(),
                     });
@@ -295,6 +298,19 @@ mod tests {
         // 避免 macOS 通过、Windows 失败的跨平台测试漂移。
         let nested = format!("sub{}b.log", std::path::MAIN_SEPARATOR);
         assert!(paths.contains(&nested.as_str()));
+        // abs_path 必须指向真实磁盘文件（点击结果跳转原文依赖它）。
+        for h in &hits {
+            assert!(
+                h.abs_path.is_absolute(),
+                "abs_path 应为绝对路径：{:?}",
+                h.abs_path
+            );
+            assert!(
+                h.abs_path.exists(),
+                "abs_path 应指向存在的文件：{:?}",
+                h.abs_path
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&d);
     }

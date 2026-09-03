@@ -154,6 +154,8 @@ pub struct AppState {
     pub pending_grep_save: bool,
     /// toolbar 置位后，在 `ui` 中取消目录检索。
     pub pending_grep_stop: bool,
+    /// 结果页点击某条命中后置位：(绝对路径, 文件内行号 1-based)，在 `ui` 中打开并跳转原文。
+    pub pending_grep_jump: Option<(PathBuf, usize)>,
 }
 
 impl AppState {
@@ -565,6 +567,47 @@ impl LogViewerApp {
         }
     }
 
+    /// 点击目录检索结果 → 跳转到原文对应行（notepad++ 风格）。
+    ///
+    /// 命中文件可能并不在当前 `fileset` 中（目录检索是临时打开、检索完即释放）：
+    /// - 若目标文件已在 `fileset`，直接按 `file_global_start + 行号` 定位；
+    /// - 否则用 [`Self::load_paths`] 打开它（替换语义，与「打开文件」一致），
+    ///   随后按该文件的全局起始行定位。
+    ///
+    /// 定位后清掉结果页选区，把正文滚动到该行并高亮（`scroll_target` + `selected_row`）。
+    fn jump_to_grep_hit(&mut self, path: &std::path::Path, line_number: usize) {
+        // 目标文件是否已在当前文件集合中？
+        let existing = self
+            .state
+            .fileset
+            .files()
+            .iter()
+            .position(|f| f.path == path);
+
+        if existing.is_none() {
+            // 不在：打开该文件（替换语义）。失败则仅提示，不打断结果页。
+            self.load_paths(vec![path.to_path_buf()]);
+            if self.state.fileset.file_count() == 0 {
+                self.state.status_text = format!("无法打开 {} 以跳转", path.display());
+                return;
+            }
+        }
+
+        // 定位到目标文件内行号：file_idx → 全局起始行 + (line_number - 1)。
+        let file_idx = existing.unwrap_or(0);
+        let Some(file) = self.state.fileset.file(file_idx) else {
+            return;
+        };
+        let local = (line_number.saturating_sub(1)).min(file.line_count().saturating_sub(1));
+        let Some(start) = self.state.fileset.file_global_start(file_idx) else {
+            return;
+        };
+        let row = start + local;
+        self.state.scroll_target = Some(row);
+        self.state.selected_row = Some(row);
+        self.state.sidebar_active_file = Some(file_idx);
+    }
+
     /// 处理一条后台目录检索消息（由 `logic` 每帧 drain）。
     fn handle_grep_msg(&mut self, msg: GrepMessage) {
         match msg {
@@ -876,6 +919,11 @@ impl eframe::App for LogViewerApp {
                 c.cancel();
             }
         }
+        // 结果页点击命中 → 跳转原文：打开目标文件并定位到行。结果面板保持打开，
+        // 便于连续点击多个结果（notepad++ 风格）；仅「返回日志」按钮显式关闭面板。
+        if let Some((path, line_number)) = self.state.pending_grep_jump.take() {
+            self.jump_to_grep_hit(&path, line_number);
+        }
         // 重新加载（spec Q6「重新加载」）：清空旧索引并重新打开所有文件，使外部 truncate/轮转生效。
         // 检索/导出/目录检索进行中禁用（G1），避免与后台线程持有的旧 Arc<LogFileIndex> 竞争。
         if self.state.pending_reload
@@ -932,13 +980,20 @@ impl eframe::App for LogViewerApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(bg))
             .show(ui, |ui| {
-                // 目录检索结果页：独立视图，替换日志正文。
-                if self.state.show_results {
-                    results_view::show(ui, &mut self.state);
-                } else {
-                    log_view::show(ui, &mut self.state);
-                }
+                log_view::show(ui, &mut self.state);
             });
+
+        // 目录检索结果：底部面板（notepad++ 风格），正文日志区保留在上方；
+        // 点击命中行跳转原文对应行，面板保持打开以便连续跳转，「返回日志」按钮关闭。
+        if self.state.show_results {
+            egui::Panel::bottom("grep_results_panel")
+                .resizable(true)
+                .default_size(220.0)
+                .frame(egui::Frame::default().fill(theme::palette(ui.ctx()).panel))
+                .show(ui, |ui| {
+                    results_view::show(ui, &mut self.state);
+                });
+        }
 
         // 性能 HUD（spec P4/P5/P6 可观测化）：仅在开启时绘制，且不主动请求重绘，
         // 避免拉高空闲 CPU（P12）。窗口内容仅在产生新帧时（滚动/检索）刷新。
