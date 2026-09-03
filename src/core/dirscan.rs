@@ -75,7 +75,7 @@ mod tests {
     }
 
     /// 在临时目录建一棵小文件树，返回 (root, 期望日志文件相对名列表)。
-    fn build_tree() -> (PathBuf, Vec<&'static str>) {
+    fn build_tree() -> (PathBuf, Vec<String>) {
         let root = unique_dir("tree");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -91,7 +91,16 @@ mod tests {
         std::fs::write(root.join(".hidden_dir").join("d.log"), b"d").unwrap();
         std::fs::write(root.join("noext"), b"x").unwrap();
 
-        (root, vec!["a.log", "sub/b.txt", "sub/c.OUT"])
+        // 期望名用平台原生分隔符渲染（Windows 为 `\`），避免 macOS 通过、Windows 失败的跨平台漂移。
+        let sep = std::path::MAIN_SEPARATOR;
+        (
+            root,
+            vec![
+                "a.log".to_string(),
+                format!("sub{sep}b.txt"),
+                format!("sub{sep}c.OUT"),
+            ],
+        )
     }
 
     #[test]
