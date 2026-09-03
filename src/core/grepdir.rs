@@ -291,7 +291,10 @@ mod tests {
         assert_eq!(hits.len(), 2);
         let paths: Vec<&str> = hits.iter().map(|h| h.display_path.as_str()).collect();
         assert!(paths.contains(&"a.log"));
-        assert!(paths.contains(&"sub/b.log"));
+        // `display_path` 用平台原生分隔符渲染（Windows 为 `\`），故期望值也按 `MAIN_SEPARATOR` 构建，
+        // 避免 macOS 通过、Windows 失败的跨平台测试漂移。
+        let nested = format!("sub{}b.log", std::path::MAIN_SEPARATOR);
+        assert!(paths.contains(&nested.as_str()));
 
         let _ = std::fs::remove_dir_all(&d);
     }
