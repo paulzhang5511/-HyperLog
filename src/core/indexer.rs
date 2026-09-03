@@ -539,6 +539,11 @@ mod tests {
     }
 
     /// `detect_dirty` 应发现被外部修改的文件（spec Q6）。
+    ///
+    /// 注意跨平台：Windows 禁止在「文件仍存在用户映射区」时写入/截断该文件
+    /// （error 1224: "user-mapped section open"）。`detect_dirty` 仅比对 stat、不触碰 mmap，
+    /// 故本测试先在外部写入前释放 mmap，再重新打开并把「打开时快照」回退为原始值，
+    /// 以稳定触发 dirty 检测，且 macOS / Windows 均可通过。
     #[test]
     fn detect_dirty_flags_external_modification() {
         let dir = std::env::temp_dir().join(format!("hyperlog_dirty_{}", std::process::id()));
@@ -547,18 +552,31 @@ mod tests {
         let p = dir.join("a.log");
         std::fs::write(&p, "line one\nline two\n").unwrap();
 
-        let mut set = FileSet::new();
-        let idx = Arc::new(LogFileIndex::open(&p).unwrap());
-        let opened_len = idx.opened_len;
-        set.push(idx);
-        assert!(set.detect_dirty().is_empty(), "未修改时应无脏文件");
+        // 记录「打开时」的体积与修改时间，作为后续比对基准。
+        let original_len = std::fs::metadata(&p).unwrap().len();
+        let original_mtime = std::fs::metadata(&p).unwrap().modified().ok();
 
-        // 外部追加内容（模拟日志滚动写入）
+        // 打开索引（持 mmap）。此时尚未被外部修改，detect_dirty 应为空。
+        let mut set = FileSet::new();
+        set.push(Arc::new(LogFileIndex::open(&p).unwrap()));
+        assert!(set.detect_dirty().is_empty(), "未修改时应无脏文件");
+        // 释放 mmap，避免在 Windows 上「文件存在用户映射区时禁止写入」。
+        drop(set);
+
+        // 外部追加内容（模拟日志滚动写入）。此刻已无 mmap 句柄，Windows 亦可写入。
         std::fs::write(&p, "line one\nline two\nline three\n").unwrap();
-        let dirty = set.detect_dirty();
+
+        // 重新打开以建立新的 mmap，但把「打开时快照」回退为原始值，
+        // 使 detect_dirty 比对新 stat 时发现不一致 → 标记为脏。
+        let mut idx2 = LogFileIndex::open(&p).unwrap();
+        idx2.opened_len = original_len;
+        idx2.opened_mtime = original_mtime;
+        let mut set2 = FileSet::new();
+        set2.push(Arc::new(idx2));
+        let dirty = set2.detect_dirty();
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0], p);
-        assert_ne!(std::fs::metadata(&p).unwrap().len(), opened_len);
+        assert_ne!(std::fs::metadata(&p).unwrap().len(), original_len);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
