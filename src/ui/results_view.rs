@@ -20,8 +20,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     // —— 结果页头 ——
     ui.horizontal(|ui| {
         ui.label(
+            // 显式取 Palette 颜色，不用 `.strong()`（会被解析成 active 前景白色，亮色主题不可见）。
             egui::RichText::new(format!("{} 条命中", crate::util::group_digits(hits.len())))
-                .strong()
                 .color(p.text),
         );
         if state.grep_truncated {

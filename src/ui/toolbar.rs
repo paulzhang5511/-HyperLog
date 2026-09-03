@@ -14,8 +14,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     egui::Panel::top("top_panel").show(ui, |ui| {
         // 窗口变窄时自动换行，而不是把控件挤出可视区
         ui.horizontal_wrapped(|ui| {
-            // 应用名：弱化为一个标签，不与日志内容争夺注意力
-            ui.label(egui::RichText::new("Hyper Log").strong());
+            // 应用名：弱化为一个标签，不与日志内容争夺注意力。
+            // 强调色必须从 Palette 显式取：`.strong()` 会解析成 `widgets.active` 的白色前景，
+            // 在亮色主题下白字白底看不见（见 theme.rs 中 `text_strong` 的注释）。
+            let brand = crate::ui::theme::palette(ui.ctx()).text_strong;
+            ui.label(egui::RichText::new("Hyper Log").color(brand));
             ui.separator();
 
             // 侧边栏目录树开关（⌘B 也可切换）

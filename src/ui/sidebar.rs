@@ -125,7 +125,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 .unwrap_or_default();
             ui.push_id("tree_root", |ui| {
                 let resp = egui::collapsing_header::CollapsingHeader::new(
-                    egui::RichText::new(format!("📂 {}", root_label(&ancestor))).strong(),
+                    // 同 toolbar：强调色显式取 Palette，不用 `.strong()`（亮色主题下会是白字）。
+                    egui::RichText::new(format!("📂 {}", root_label(&ancestor)))
+                        .color(p.text_strong),
                 )
                 .default_open(true)
                 .show(ui, |ui| {

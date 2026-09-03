@@ -44,6 +44,14 @@ pub struct Palette {
     pub control_hover: Color32,
     /// 正文。
     pub text: Color32,
+    /// 强调文本：应用名、目录树根节点等比正文更醒目一档的文字。
+    ///
+    /// 注意：**不要**用 `RichText::strong()` 取强调色——egui 会把它解析为
+    /// `Visuals::strong_text_color()`，而后者等于 `widgets.active.text_color()`。
+    /// 本主题把 active 的前景色固定为白色（accent 蓝底按钮需要白字），
+    /// 于是 `.strong()` 在亮色主题下会渲染成白字白底、完全不可见。
+    /// 因此强调色一律从 `Palette` 显式取值，按主题分档。
+    pub text_strong: Color32,
     /// 次要文本：行号、状态栏信息。
     pub text_dim: Color32,
     /// 强调色（焦点环、进度条、链接）。
@@ -75,6 +83,8 @@ pub const DARK: Palette = Palette {
     border: Color32::from_rgb(0x3C, 0x3C, 0x3C),
     control_hover: Color32::from_rgb(0x3F, 0x43, 0x47),
     text: Color32::from_rgb(0xD4, 0xD4, 0xD4),
+    // 暗色主题：正文浅灰 → 强调取纯白，一档更亮。
+    text_strong: Color32::from_rgb(0xFF, 0xFF, 0xFF),
     text_dim: Color32::from_rgb(0x85, 0x85, 0x85),
     accent: Color32::from_rgb(0x0E, 0x63, 0x9C),
     selection: Color32::from_rgb(0x26, 0x4F, 0x78),
@@ -101,6 +111,8 @@ pub const LIGHT: Palette = Palette {
     border: Color32::from_rgb(0xCE, 0xCE, 0xCE),
     control_hover: Color32::from_rgb(0xE8, 0xE8, 0xE8),
     text: Color32::from_rgb(0x33, 0x33, 0x33),
+    // 亮色主题：正文深灰 → 强调取近黑，一档更暗（注意不能沿用 active 的白色）。
+    text_strong: Color32::from_rgb(0x1A, 0x1A, 0x1A),
     text_dim: Color32::from_rgb(0x99, 0x99, 0x99),
     accent: Color32::from_rgb(0x00, 0x7A, 0xCC),
     selection: Color32::from_rgb(0xAD, 0xD6, 0xFF),
@@ -274,5 +286,61 @@ fn spacing() -> egui::style::Spacing {
         text_edit_width: 200.0,
         extra_text_line_spacing: 0.0,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG 2.1 相对亮度。
+    fn luminance(c: Color32) -> f32 {
+        let chan = |v: u8| {
+            let s = f32::from(v) / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * chan(c.r()) + 0.7152 * chan(c.g()) + 0.0722 * chan(c.b())
+    }
+
+    /// WCAG 对比度（1.0 ~ 21.0）。
+    fn contrast(fg: Color32, bg: Color32) -> f32 {
+        let (a, b) = (luminance(fg), luminance(bg));
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 正文与强调文字在顶栏背景上必须清晰可读（≥ 4.5:1，WCAG AA）。
+    ///
+    /// 回归守卫：应用名曾用 `RichText::strong()`，而 egui 把它解析为
+    /// `widgets.active` 的**白色**前景；暗色顶栏上尚可读，亮色顶栏（近白）上则
+    /// 白字白底完全不可见。故强调色改由 `Palette::text_strong` 显式提供，并用本
+    /// 用例锁住「两套主题下前景与背景都有足够对比」这一不变量。
+    #[test]
+    fn foreground_colors_are_readable_on_panel() {
+        for p in [&DARK, &LIGHT] {
+            for (name, fg, min) in [
+                ("text", p.text, 4.5),
+                ("text_strong", p.text_strong, 4.5),
+                // 次要文本（行号/状态栏）本就刻意弱化，只做「不能退化到看不见」的下限守卫。
+                ("text_dim", p.text_dim, 2.0),
+            ] {
+                let ratio = contrast(fg, p.panel);
+                assert!(
+                    ratio >= min,
+                    "{name} 在顶栏背景上对比度仅 {ratio:.2}:1，低于下限 {min}:1"
+                );
+            }
+        }
+    }
+
+    /// 强调色必须与正文字色不同，否则「强调」失去意义（且难以肉眼验证）。
+    #[test]
+    fn text_strong_differs_from_text() {
+        assert_ne!(DARK.text_strong, DARK.text);
+        assert_ne!(LIGHT.text_strong, LIGHT.text);
     }
 }
