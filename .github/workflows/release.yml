@@ -49,11 +49,11 @@ jobs:
 
       - name: Package (Windows)
         if: matrix.target == 'windows'
-        shell: bash
+        shell: pwsh
         run: |
-          mkdir -p dist
-          cp target/release/hyper-log.exe dist/
-          ( cd dist && rm -f hyper-log-windows.zip && zip -r hyper-log-windows.zip hyper-log.exe )
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/hyper-log.exe dist/
+          Compress-Archive -Path dist/hyper-log.exe -DestinationPath dist/hyper-log-windows.zip -Force
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
