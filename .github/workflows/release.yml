@@ -10,6 +10,11 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# 上传 Release 资产需要写权限（默认的 GITHUB_TOKEN 在部分仓库为只读，会导致
+# softprops/action-gh-release 的 upload 步骤 403/失败）。
+permissions:
+  contents: write
+
 jobs:
   build:
     name: ${{ matrix.target }}
