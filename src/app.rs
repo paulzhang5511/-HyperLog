@@ -256,10 +256,35 @@ impl LogViewerApp {
         app.state.wrap = app.state.prefs.wrap;
         app.state.show_sidebar = app.state.prefs.sidebar_visible;
         // 启动即载入（命令行 `--open`/位置参数）：M16 为支撑实机观测与「终端秒开日志」而加。
+        // 目录在此展开为日志文件列表，使 `hyper-log <dir>` 与「打开目录」等价。
+        let initial_paths = Self::expand_initial_paths(initial_paths);
         if !initial_paths.is_empty() {
             app.load_paths(initial_paths);
         }
         app
+    }
+
+    /// 展开初始路径：目录递归展开为日志文件（复用目录扫描），文件保持原样。
+    ///
+    /// 命令行既可以是文件也可以是目录（拖目录到图标/终端传目录都应当可用）；
+    /// 目录展开失败（无日志文件）只告警，不中断其余路径的加载。
+    fn expand_initial_paths(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::with_capacity(paths.len());
+        for p in paths {
+            if p.is_dir() {
+                let files = crate::core::dirscan::collect_log_files(&p);
+                if files.is_empty() {
+                    log::warn!(
+                        "目录 {} 下未找到日志文件（.log/.txt/.out 或无后缀）",
+                        p.display()
+                    );
+                }
+                out.extend(files);
+            } else {
+                out.push(p);
+            }
+        }
+        out
     }
 
     /// 全局快捷键（spec §7.7 常用快捷键）。
@@ -316,6 +341,7 @@ impl LogViewerApp {
         let picked = rfd::FileDialog::new()
             .set_title("打开日志文件")
             .add_filter("日志文件", &["log", "txt", "out"])
+            .add_filter("所有文件", &["*"])
             .pick_files();
 
         let Some(paths) = picked else {
@@ -339,8 +365,10 @@ impl LogViewerApp {
 
         let files = crate::core::dirscan::collect_log_files(&dir);
         if files.is_empty() {
-            self.state.status_text =
-                format!("目录 {} 下未找到日志文件（.log/.txt/.out）", dir.display());
+            self.state.status_text = format!(
+                "目录 {} 下未找到日志文件（.log/.txt/.out 或无后缀）",
+                dir.display()
+            );
             return;
         }
         self.load_paths(files);

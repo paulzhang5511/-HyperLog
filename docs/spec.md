@@ -455,6 +455,12 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
   分段合成一个 job），行背景与行号用 `Painter` 绘制，widget 数从 O(行×分段) 降到 O(行)（§8.4）。
 - `Wrap` 关闭时启用 `ScrollArea` 双向滚动，横向范围按「采样的最长行宽」固定（CJK 按 1.7 倍宽加权）；
   开启时行高统一按最长行的折行数放大（`MAX_WRAP_LINES` 封顶，P1 的 MVP 方案）。
+- **滚动方向锁定**（修复「上下滑动时正文左右漂移」）：egui 的 `ScrollArea` 对 x/y **两个方向
+  独立累加** `smooth_scroll_delta`、没有主控方向判定，触控板双指上下滑动所带的轻微水平分量会被
+  如实计入横向偏移。故在日志区渲染前调用 `ui/log_view.rs::lock_scroll_axis` 改写 `InputState`：
+  按 `AXIS_LOCK_RATIO`（默认 0.3）判定主控方向——次要方向分量小于主要方向的 0.3 倍则清零，
+  真正的斜向滚动原样保留，单方向输入（普通滚轮）不受影响。纯计算逻辑抽为 `locked_scroll_delta`
+  以便单测。**必须在 ScrollArea 消费 delta 之前改写**，因为 ScrollArea 滚动后会把对应分量清零。
 - **检索命中高亮**：命中段仅叠加荧光笔底色（`hit_bg`），文字沿用正常 `text` 色——保证高亮后
   内容仍清晰可读（VS Code 风格），不再改文字色（早期版本同时改底色+文字色导致低对比、看不清）。
 - 检索中**不禁用**滚动区与"停止"按钮（G1）；仅禁用"打开文件""导出""搜索"自身。
@@ -473,9 +479,13 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
 ### 7.7.1 打开目录（Q「打开目录」）
 
 - `core::dirscan::collect_log_files(root)` 递归收集目录树下的日志文件（`.log`/`.txt`/`.out`，
-  大小写不敏感），跳过隐藏条目（`.` 开头）与符号链接（防环），按路径升序返回确定性结果。
+  大小写不敏感，以及**无扩展名的文件**——现实中不少日志没有后缀，如 `access`、`debug`、
+  `foo.log.1` 滚动归档），跳过隐藏条目（`.` 开头）与符号链接（防环），按路径升序返回确定性结果。
 - 工具栏「打开目录」弹目录选择框，收集到的文件复用 `load_paths` 批量加载（与单文件打开
   同一套校验：空文件跳过、累计 32 GiB 上限、成功才记入最近文件）。
+- **命令行也接受目录**：`App::expand_initial_paths` 在 `new()` 中把初始路径里的目录递归展开为
+  日志文件（复用 `dirscan::collect_log_files`），文件保持原样，使 `hyper-log <dir>` 与
+  「打开目录」等价；目录下无日志文件时只告警，不中断其余路径加载。
 
 ### 7.7.2 查找全部（Q「查找全部」）
 
@@ -975,3 +985,5 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-03 | 「查找全部」结果交互对齐 notepad++：① `GrepHit` 新增内联**绝对路径 `abs_path: PathBuf`**（保留 `display_path` 展示用），`search_one_file` 构造时填 `idx.path`；② 结果页由「中央区全屏替换」改为**底部结果面板**（`egui::Panel::bottom`，正文日志区保留在上方），面板 `resizable` 默认高 220px；③ **点击命中行 → 跳转原文对应行**：置 `pending_grep_jump=(abs_path, 行号)`，`app.rs::jump_to_grep_hit` 落实——目标文件已在 `FileSet` 则按 `file_global_start + 行号` 定位，否则 `load_paths` 打开（替换语义）再定位，正文 `scroll_target`+`selected_row` 滚动并高亮该行，同时高亮侧边栏对应文件；结果面板**保持打开**以便连续跳转，仅「返回日志」显式关闭。§7.7.3 标题「独立结果页」改「底部结果面板」并补跳转契约。新增 `grepdir` 单测断言 `abs_path` 为绝对且存在的路径。门禁 fmt/clippy(-D warnings)/58 单测/release 构建/窗口冒烟 ALIVE 均绿 | Agent |
 | 2026-09-04 | 查找结果「面板」改「浮动窗口」：① `app.rs` 把 `Panel::bottom("grep_results_panel")` 改为 `egui::Window::new("查找结果").id(Id::new("grep_results_window"))`，不挤压正文布局；`.open(&mut show_results)` 让窗口 ✕ 与「返回日志」按钮共同作用到同一状态（`Panel::bottom` 版本关闭按钮无法真正关闭）。② **可移动 + 宽度 80%**：定位不用 `.anchor`（会在每次从关闭重开时强制拉回锚点，表现为「固定不可移动」），改用 `.default_pos` 仅首次定位底部居中 + `.movable(true)`；宽度取 `ctx.input(|i| i.content_rect()).width() * 0.8`（下限 400px）。③ **egui 0.36 API 坑**：`Context::screen_rect()` 已移除、`InputState` 也无 `screen_rect`，取视口矩形用 `i.content_rect()`（= viewport_rect 去掉安全区）或 `i.viewport_rect()`。§7.7.3 由「底部结果面板」改写为「结果浮动窗口」。门禁 fmt/clippy(-D warnings)/58 单测/release 构建/窗口冒烟 ALIVE 均绿 | Agent |
 | 2026-09-04 | 发布 0.0.3：① **README 重写**为使用者视角（下载安装/从源码构建/使用说明/快捷键/平台支持/已知限制）；② 新增 `.github/workflows/release.yml`——推送 `v*` tag 时构建 release 二进制（macOS 复用 `scripts/package_macos.sh` 产 `.app`+zip、Windows 产 `hyper-log.exe`+zip）并用 `softprops/action-gh-release@v2` 上传到 GitHub Release 附带二进制；③ 版本号 `Cargo.toml`/`Cargo.lock`/`docs/prd.md` 0.0.2→0.0.3 | Agent |
+| 2026-09-05 | 支持无后缀日志文件：`dirscan::is_log_file` 由「仅 .log/.txt/.out」改为「扩展名为日志类型**或无扩展名**即视为日志候选」（现实中不少日志无后缀，如 `access`/`debug`/`foo.log.1` 滚动归档）；`app.rs::open_files` 文件对话框新增「所有文件 (*)」过滤器以便选择无后缀文件；`open_directory`/`grepdir` 的「未找到日志文件」提示同步改为「.log/.txt/.out 或无后缀」。§7.7.1 同步。`dirscan` 测试补无后缀文件（`noext`/`debug`）应被收集、无关后缀（`.md`/`.zip`）仍跳过的断言 | Agent |
+| 2026-09-05 | ① **支持无后缀日志文件**：`dirscan::is_log_file` 由「仅 .log/.txt/.out」改为「扩展名为日志类型**或无扩展名**即视为日志候选」；`app.rs::open_files` 文件对话框新增「所有文件 (*)」过滤器；`open_directory`/`grepdir` 提示同步。新增 fixture `tests/fixtures/no_extension` 与单测 `no_extension_file_is_indexed_normally`。② **命令行支持打开目录**：`App::expand_initial_paths` 在 `new()` 中把初始路径里的目录递归展开为日志文件（复用 `dirscan`），使 `hyper-log <dir>` 与「打开目录」等价，§7.7.1 补契约。③ **滚动方向锁定**：修「上下滑动时正文左右漂移」——egui `ScrollArea` 对 x/y 独立累加 delta 无主控方向判定，`lock_scroll_axis` 按 `AXIS_LOCK_RATIO=0.3` 清零次要分量，纯逻辑抽 `locked_scroll_delta` 并补 4 个单测。§7.7 补契约。单测 58→63，门禁 fmt/clippy(-D warnings)/窗口冒烟 ALIVE 均绿 | Agent |

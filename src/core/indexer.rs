@@ -478,6 +478,22 @@ mod tests {
     }
 
     #[test]
+    fn no_extension_file_is_indexed_normally() {
+        // 无后缀的日志文件（如 `access`/`debug`/滚动归档）应能正常建索引并读取，
+        // 索引层不依赖扩展名判断，只按内容解析换行。
+        let idx = LogFileIndex::open(fixture("no_extension")).unwrap();
+        assert_eq!(idx.line_count(), 3);
+        assert_eq!(
+            idx.line(0).unwrap(),
+            "2026-09-05 11:00:00.001 INFO  no-extension log line one"
+        );
+        assert_eq!(
+            idx.line(2).unwrap(),
+            "2026-09-05 11:00:00.003 ERROR no-extension log line three"
+        );
+    }
+
+    #[test]
     fn two_empty_lines() {
         let dir = std::env::temp_dir().join("hyperlog_two_blank.log");
         std::fs::write(&dir, b"\n\n").unwrap();

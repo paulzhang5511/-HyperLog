@@ -29,7 +29,54 @@ const MAX_WRAP_LINES: usize = 8;
 /// 估算最长行时最多采样多少行（详见 [`estimate_content_width`]）。
 const SAMPLE_LINES: usize = 20_000;
 
+/// 滚动方向锁定阈值：次要方向的分量需超过主要方向的该比例，才被认为是「双向滚动」。
+///
+/// 触控板双指上下滑动几乎总带一点水平分量（手势不可能绝对垂直），若照单全收，
+/// 正文就会在上下滑动的同时左右漂移。取 0.3 表示「垂直分量比水平大 3 倍以上才算纯垂直」。
+const AXIS_LOCK_RATIO: f32 = 0.3;
+
+/// 按主控方向裁剪滚动增量：垂直占优时丢弃水平分量，水平占优时丢弃垂直分量。
+///
+/// 抽成纯函数以便单测（不依赖 `egui::Ui`）。
+fn locked_scroll_delta(d: egui::Vec2) -> egui::Vec2 {
+    let (ax, ay) = (d.x.abs(), d.y.abs());
+    // 单方向输入（普通鼠标滚轮、纯水平/纯垂直触控板）无需锁定。
+    if ax == 0.0 || ay == 0.0 {
+        return d;
+    }
+    let (major, vertical_dominant) = if ay >= ax { (ay, true) } else { (ax, false) };
+    let minor = if vertical_dominant { ax } else { ay };
+    // 次要方向足够显著才保留（真正的斜向滚动），否则视为手抖丢弃。
+    if minor >= major * AXIS_LOCK_RATIO {
+        return d;
+    }
+    if vertical_dominant {
+        egui::vec2(0.0, d.y)
+    } else {
+        egui::vec2(d.x, 0.0)
+    }
+}
+
+/// 按本帧主控方向锁定滚动：垂直占优时丢弃水平分量，水平占优时丢弃垂直分量。
+///
+/// egui 的 `ScrollArea` 对 x/y **两个方向独立累加** `smooth_scroll_delta`、没有主控方向判定
+/// （`scroll_area.rs` 中 `for d in 0..2` 分别取 `smooth_scroll_delta()[d]`），
+/// 因此触控板上下滑动的轻微水平分量会被如实计入横向偏移——表现为「上下滑的时候内容左右跑」。
+///
+/// 必须在 `ScrollArea` 消费 delta **之前**改写 `InputState`，因为 ScrollArea 会在滚动后
+/// 把对应分量清零，事后无法修正。
+fn lock_scroll_axis(ui: &mut egui::Ui) {
+    let d = ui.input(|i| i.smooth_scroll_delta);
+    let locked = locked_scroll_delta(d);
+    if locked != d {
+        ui.ctx().input_mut(|i| i.smooth_scroll_delta = locked);
+    }
+}
+
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    // 触控板上下滑动常带轻微水平分量，先锁定主控方向再交给 ScrollArea，
+    // 避免正文在上下滚动时左右漂移。
+    lock_scroll_axis(ui);
     let p = theme::palette(ui.ctx());
     let in_result = state.in_result_mode && !state.search_results.is_empty();
     let total = if in_result {
@@ -352,6 +399,54 @@ mod tests {
         assert_eq!(digits_of(9), 1);
         assert_eq!(digits_of(10), 2);
         assert_eq!(digits_of(99_999_999), 8);
+    }
+
+    /// 触控板上下滑动带轻微水平分量时，水平分量应被丢弃，避免正文左右漂移。
+    #[test]
+    fn lock_drops_horizontal_when_vertical_dominant() {
+        let v = egui::vec2(3.0, 100.0);
+        assert_eq!(locked_scroll_delta(v), egui::vec2(0.0, 100.0));
+        // 向上滑（负 y）同样只保留垂直分量
+        assert_eq!(
+            locked_scroll_delta(egui::vec2(-4.0, -80.0)),
+            egui::vec2(0.0, -80.0)
+        );
+    }
+
+    /// 反之：水平滑动时的轻微垂直分量也应丢弃。
+    #[test]
+    fn lock_drops_vertical_when_horizontal_dominant() {
+        assert_eq!(
+            locked_scroll_delta(egui::vec2(100.0, 2.0)),
+            egui::vec2(100.0, 0.0)
+        );
+        assert_eq!(
+            locked_scroll_delta(egui::vec2(-90.0, -5.0)),
+            egui::vec2(-90.0, 0.0)
+        );
+    }
+
+    /// 真正的斜向滚动（次要方向足够显著）应原样保留，不能锁死双向滚动。
+    #[test]
+    fn lock_keeps_diagonal_when_minor_is_significant() {
+        let v = egui::vec2(80.0, 100.0);
+        assert_eq!(locked_scroll_delta(v), v);
+        let h = egui::vec2(100.0, 70.0);
+        assert_eq!(locked_scroll_delta(h), h);
+    }
+
+    /// 单方向输入（普通鼠标滚轮）不受影响，避免误伤纯垂直/纯水平滚动。
+    #[test]
+    fn lock_leaves_single_axis_untouched() {
+        assert_eq!(
+            locked_scroll_delta(egui::vec2(0.0, 40.0)),
+            egui::vec2(0.0, 40.0)
+        );
+        assert_eq!(
+            locked_scroll_delta(egui::vec2(40.0, 0.0)),
+            egui::vec2(40.0, 0.0)
+        );
+        assert_eq!(locked_scroll_delta(egui::Vec2::ZERO), egui::Vec2::ZERO);
     }
 
     #[test]

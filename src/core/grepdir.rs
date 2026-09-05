@@ -93,7 +93,7 @@ pub fn run_grep(
     let total_files = files.len();
     if total_files == 0 {
         let _ = tx.send(GrepMessage::Failed(format!(
-            "目录 {} 下未找到日志文件（.log/.txt/.out）",
+            "目录 {} 下未找到日志文件（.log/.txt/.out 或无后缀）",
             root.display()
         )));
         return;
