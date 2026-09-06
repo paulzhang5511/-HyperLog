@@ -116,6 +116,12 @@ pub struct PaneState {
     /// - `None` → 仅 `selected_row` 单行选中；
     /// - `Some(a)` → 选中 `[min(a, selected_row), max(a, selected_row)]`。
     pub selection_anchor: Option<usize>,
+    /// 行号槽拖动多选进行中时，记录「拖动起点行」；松手（pointer release）即清空。
+    ///
+    /// 与 `selection_anchor` 的区别：后者是选区端点之一（跨帧稳定），本字段仅用于
+    /// 跟踪一次拖拽手势的起点，拖拽过程中 `selection_anchor` 被固定为 `drag_anchor`、
+    /// `selected_row` 跟随指针悬停行，从而实现「按住行号槽上下拖 = 连续多选」。
+    pub drag_anchor: Option<usize>,
     /// 待跳转行号，由该面板自己消费（替代原先的全局 `AppState::scroll_target`）。
     pub scroll_target: Option<usize>,
     /// 折行开关（每面板独立）。
@@ -174,10 +180,11 @@ impl PaneState {
         self.selected_row = Some(last_row);
     }
 
-    /// 清空选中态（含锚点）。
+    /// 清空选中态（含锚点）。进行中的行号槽拖拽也一并取消。
     pub fn clear_selection(&mut self) {
         self.selected_row = None;
         self.selection_anchor = None;
+        self.drag_anchor = None;
     }
 }
 

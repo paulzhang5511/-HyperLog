@@ -96,7 +96,12 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
     let p = theme::palette(ui.ctx());
     let in_result = pane.in_result_mode && !state.search_results.is_empty();
     // 面板单独打开了文件就用它自己的文件集，否则共享全局文件集。
-    let fileset: &FileSet = pane.fileset_override.as_ref().unwrap_or(&state.fileset);
+    // 持有所有权（`FileSet` 是 `Vec<Arc<..>>` 浅克隆，开销可忽略），避免对 `pane` 的不可变借用
+    // 与闭包内 `pane.select_*` 等可变借用冲突（E0500）。
+    let fileset: FileSet = match &pane.fileset_override {
+        Some(fs) => fs.clone(),
+        None => state.fileset.clone(),
+    };
     let total = if in_result {
         state.search_results.len()
     } else {
@@ -137,7 +142,7 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
     // 横向滚动范围按「估算的最长行」固定：若跟随当前可见行，滚动条长度会随滚动抖动。
     // 首次（max_line_width==0）惰性估算，避免每帧扫描；`load_paths`/`reload` 清零各面板时也会重算。
     if pane.max_line_width <= 0.0 {
-        pane.max_line_width = estimate_content_width(fileset);
+        pane.max_line_width = estimate_content_width(&fileset);
     }
     let content_w = pane.max_line_width.max(avail_text_w);
     let (row_h, text_w) = if pane.wrap {
@@ -165,6 +170,8 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
 
     let mut clicked: Option<(usize, bool)> = None;
     let mut copied: Option<String> = None;
+    // 行号槽拖动多选：记录本次拖动中指针**悬停**到的那一行（闭包内每帧至多命中一个可见行）。
+    let mut drag_hover: Option<usize> = None;
 
     let out = egui::ScrollArea::both()
         // 各面板必须用不同的 id，否则滚动位置会串（egui 按 Id 存 ScrollArea 状态）。
@@ -172,7 +179,7 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
         .auto_shrink([false; 2])
         .show_rows(ui, row_h, total, |ui, range| {
             for row in range {
-                let (line, gutter_text) = row_content(state, fileset, row, in_result);
+                let (line, gutter_text) = row_content(state, &fileset, row, in_result);
                 let text = truncate_for_render(&line);
                 // 多选时整个区间都高亮（锚点模型见 `PaneState::selection_anchor`）。
                 let selected = pane.is_row_selected(row);
@@ -189,9 +196,30 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
                     // 1) 行背景与行号：先画，位于文本之下
                     paint_row_bg(ui, row_rect, gutter_w, &gutter_text, selected, is_cursor, p);
 
-                    // 2) 行号槽：可点击选中整行
-                    let (_, gutter_resp) =
-                        ui.allocate_exact_size(egui::vec2(gutter_w, row_h), egui::Sense::click());
+                    // 2) 行号槽：可点击选中整行，按住上下拖动 = 连续多选（VS Code 风）。
+                    //    `click_and_drag` 同时提供 `drag_started`（按下帧）与 `dragged`/`hovered`（拖动中）。
+                    let (_, gutter_resp) = ui.allocate_exact_size(
+                        egui::vec2(gutter_w, row_h),
+                        egui::Sense::click_and_drag(),
+                    );
+
+                    // 行号槽拖拽起点：Shift 时以既有选区为固定端扩展，否则从该行起新建选区。
+                    if gutter_resp.drag_started() {
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        if shift {
+                            // 保留既有选中（selection_anchor 或 selected_row）作为固定端。
+                            let keep = pane.selection_anchor.or(pane.selected_row);
+                            pane.extend_selection_to(row);
+                            pane.drag_anchor = keep;
+                        } else {
+                            pane.select_single(row);
+                            pane.drag_anchor = Some(row);
+                        }
+                    }
+                    // 拖动中：记录指针当前悬停的行，闭包结束后据此扩展选区。
+                    if pane.drag_anchor.is_some() && gutter_resp.hovered() {
+                        drag_hover = Some(row);
+                    }
 
                     // 3) 正文：一个 Label 承载整行的多色分段
                     ui.add_space(TEXT_PAD);
@@ -226,7 +254,7 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
                             if ui.button(label).clicked() {
                                 if let Some((s, e)) = pane.selected_range() {
                                     copied = Some(collect_selected_rows(
-                                        state, fileset, s, e, in_result,
+                                        state, &fileset, s, e, in_result,
                                     ));
                                 }
                                 ui.close();
@@ -240,6 +268,34 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
                 });
             }
         });
+
+    // 行号槽拖动多选收尾：把「起点行 → 悬停行」的区间落实为当前选区。
+    // 注意必须在消费 scroll_target **之前**处理，这样下方边缘自动滚动的 scroll_target 才能当帧生效。
+    if pane.drag_anchor.is_some() {
+        if let Some(hover) = drag_hover {
+            let a = pane.drag_anchor.unwrap();
+            pane.selection_anchor = Some(a);
+            pane.selected_row = Some(hover);
+        }
+        // 拖动到可视区上下边缘时自动滚屏，以便选中屏幕外的行（VS Code 行为）。
+        let vp = out.inner_rect;
+        let margin = row_h * 2.0;
+        let ptr = ui
+            .input(|i| i.pointer.interact_pos())
+            .unwrap_or(vp.center());
+        if ptr.y <= vp.top() + margin {
+            let top_row = (out.state.offset.y / row_h).floor().max(0.0) as usize;
+            pane.scroll_target = Some(top_row.saturating_sub(1));
+        } else if ptr.y >= vp.bottom() - margin {
+            let visible = (vp.height() / row_h).floor() as usize;
+            let top_row = (out.state.offset.y / row_h).floor().max(0.0) as usize;
+            pane.scroll_target = Some((top_row + visible + 1).min(total - 1));
+        }
+        // 松手即结束拖拽。
+        if ui.input(|i| i.pointer.any_released()) {
+            pane.drag_anchor = None;
+        }
+    }
 
     // 行号跳转：消费本面板自己的 scroll_target，直接设置滚动区纵向偏移（行高固定 → row*row_h）。
     // 行高固定是虚拟滚动 O(1) 定位的前提，故可用闭式偏移精确跳转（spec §7.2）。
