@@ -281,7 +281,7 @@ impl AppState {
         }
     }
 
-    /// 活动面板的可变引用（越界时回退到第一个）。
+    /// 活动面板的可变引用（越界时回退到最后一个，`min(len-1)`）。
     pub fn active_pane_mut(&mut self) -> &mut PaneState {
         let i = self.active_pane.min(self.panes.len().saturating_sub(1));
         &mut self.panes[i]
@@ -1445,71 +1445,91 @@ fn render_one_pane(ui: &mut egui::Ui, state: &mut AppState, pane_id: usize) -> O
     let p = theme::palette(ui.ctx());
 
     // —— 标题条：点击激活、显示文件、本面板打开 / 返回共享 / 关闭按钮 ——
-    let close_clicked = egui::Frame::default()
-        .inner_margin(egui::vec2(4.0, 2.0))
-        .fill(if is_active { p.row_active } else { p.panel })
-        .show(ui, |ui| {
-            let title = pane_title(state, pane_id);
-            // 点击标题条（非按钮区）激活该面板。
-            let label = ui.selectable_label(is_active, title);
-            if label.clicked() && !is_active {
-                state.active_pane = pane_id;
-                state.sync_active_pane_mirror();
-            }
-            let mut closed = false;
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if state.pane_layout.count > 1 && ui.small_button("✕").clicked() {
-                    closed = true;
-                }
-                // 该面板已单独打开文件 → 提供「返回共享」；否则提供「本面板打开」单独载入一个文件。
-                if state.panes[pane_id].fileset_override.is_some() {
-                    if ui
-                        .small_button("共享")
-                        .on_hover_text("改回共享全局文件集")
-                        .clicked()
-                    {
-                        state.panes[pane_id].fileset_override = None;
-                        state.panes[pane_id].selected_row = None;
-                        state.panes[pane_id].scroll_target = None;
-                        state.panes[pane_id].max_line_width = 0.0; // 惰性重算
-                    }
-                } else if ui
-                    .small_button("本面板")
-                    .on_hover_text("在本面板单独打开一个日志文件（与全局文件集脱钩）")
+    //
+    // 不能用 `Frame::show`：`Frame::begin` 会把**整个面板高度**作为 content_ui 的 max_rect，
+    // 而标题条里垂直居中的 `selectable_label` 会把 min_rect 撑满整个高度，导致 `Frame::end`
+    // 把父 ui 的 cursor 推进到面板底部 —— 正文就只剩 0 高度（内容不显示的根因）。
+    // 这里用 `horizontal` 手动布局，标题条只占自然高度，正文再取剩余矩形。
+    let title_top = ui.cursor().min.y;
+    let mut closed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let title = pane_title(state, pane_id);
+        // 点击标题条（非按钮区）激活该面板。
+        let label = ui.selectable_label(is_active, title);
+        if label.clicked() && !is_active {
+            state.active_pane = pane_id;
+            state.sync_active_pane_mirror();
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // 该面板已单独打开文件 → 提供「返回共享」；否则提供「本面板打开」单独载入一个文件。
+            if state.panes[pane_id].fileset_override.is_some() {
+                if ui
+                    .small_button("共享")
+                    .on_hover_text("改回共享全局文件集")
                     .clicked()
                 {
-                    state.pending_open_in_pane = Some(pane_id);
+                    state.panes[pane_id].fileset_override = None;
+                    state.panes[pane_id].selected_row = None;
+                    state.panes[pane_id].scroll_target = None;
+                    state.panes[pane_id].max_line_width = 0.0; // 惰性重算
                 }
-            });
-            closed
-        })
-        .inner;
+            } else if ui
+                .small_button("本面板")
+                .on_hover_text("在本面板单独打开一个日志文件（与全局文件集脱钩）")
+                .clicked()
+            {
+                state.pending_open_in_pane = Some(pane_id);
+            }
+            if state.pane_layout.count > 1 && ui.small_button("✕").clicked() {
+                closed = true;
+            }
+        });
+    });
+    // 标题条背景：活动面板用高亮色，非活动用面板底色。
+    let title_rect = egui::Rect::from_min_max(
+        egui::pos2(ui.max_rect().left(), title_top),
+        egui::pos2(ui.max_rect().right(), ui.cursor().min.y),
+    );
+    ui.painter().rect_filled(
+        title_rect,
+        0.0,
+        if is_active { p.row_active } else { p.panel },
+    );
 
     // —— 正文：编辑器风格日志区 ——
-    egui::Frame::default()
-        .inner_margin(0.0)
-        .outer_margin(0.0)
-        // 活动面板描边高亮，非活动用细边框区分（VSCode 编辑器组选中态）。
-        .stroke(if is_active {
+    let body_rect = ui.available_rect_before_wrap();
+    let mut body = ui.new_child(egui::UiBuilder {
+        max_rect: Some(body_rect),
+        layout: Some(*ui.layout()),
+        ..Default::default()
+    });
+    // 活动面板描边高亮，非活动用细边框区分（VSCode 编辑器组选中态）。
+    body.painter().rect_stroke(
+        body_rect,
+        0.0,
+        if is_active {
             egui::Stroke::new(2.0, p.accent)
         } else {
             egui::Stroke::new(1.0, p.border)
-        })
-        .show(ui, |ui| {
-            let before = state.panes[pane_id].selected_row;
-            let mut pane = state.panes[pane_id].clone();
-            crate::ui::log_view::show(ui, &*state, &mut pane, pane_id);
-            // 点击正文行会更新该面板的 selected_row：若发生变化，把此面板设为活动面板，
-            // 使跳转 / 复制 / 折行等后续操作作用于它（spec §7.7.7）。
-            let row_clicked = pane.selected_row != before;
-            state.panes[pane_id] = pane;
-            if row_clicked && !is_active {
-                state.active_pane = pane_id;
-                state.sync_active_pane_mirror();
-            }
-        });
+        },
+        egui::StrokeKind::Inside,
+    );
+    {
+        let before = state.panes[pane_id].selected_row;
+        let mut pane = state.panes[pane_id].clone();
+        crate::ui::log_view::show(&mut body, &*state, &mut pane, pane_id);
+        // 点击正文行会更新该面板的 selected_row：若发生变化，把此面板设为活动面板，
+        // 使跳转 / 复制 / 折行等后续操作作用于它（spec §7.7.7）。
+        let row_clicked = pane.selected_row != before;
+        state.panes[pane_id] = pane;
+        if row_clicked && !is_active {
+            state.active_pane = pane_id;
+            state.sync_active_pane_mirror();
+        }
+    }
 
-    if close_clicked { Some(pane_id) } else { None }
+    if closed { Some(pane_id) } else { None }
 }
 
 /// 面板的标题文字：共享文件集显示当前高亮文件名（或文件数），单独打开的文件集显示其文件名。
@@ -1537,5 +1557,266 @@ fn pane_title(state: &AppState, pane_id: usize) -> String {
         } else {
             format!("{n} 个文件")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个已就绪的 `AppState`：`panes` 覆盖 `pane_layout.count` 且 `active_pane` 指向 0。
+    fn ready_state() -> AppState {
+        let mut s = AppState::default();
+        s.ensure_panes();
+        s
+    }
+
+    // —— SplitDir / PaneLayout ——
+
+    #[test]
+    fn split_dir_perpendicular_swaps_axis() {
+        assert_eq!(SplitDir::Horizontal.perpendicular(), SplitDir::Vertical);
+        assert_eq!(SplitDir::Vertical.perpendicular(), SplitDir::Horizontal);
+    }
+
+    #[test]
+    fn pane_layout_default_is_single_horizontal() {
+        let l = PaneLayout::default();
+        assert_eq!(l.count, 1);
+        assert_eq!(l.dir, SplitDir::Horizontal);
+    }
+
+    #[test]
+    fn split_from_single_sets_direction_then_increments() {
+        let mut l = PaneLayout::default();
+        l.split(SplitDir::Vertical);
+        assert_eq!(l.count, 2);
+        assert_eq!(l.dir, SplitDir::Vertical); // 首个拆分决定方向
+        l.split(SplitDir::Horizontal);
+        assert_eq!(l.count, 3);
+        assert_eq!(l.dir, SplitDir::Vertical); // 方向不再被后续拆分覆盖
+    }
+
+    #[test]
+    fn split_caps_at_max_panes() {
+        let mut l = PaneLayout::default();
+        for _ in 0..10 {
+            l.split(SplitDir::Horizontal);
+        }
+        assert_eq!(l.count, MAX_PANES);
+        assert_eq!(l.count, 4);
+    }
+
+    #[test]
+    fn close_refuses_single_and_out_of_range() {
+        let mut l = PaneLayout::default();
+        assert!(!l.close(0)); // 单面板不可关
+        assert_eq!(l.count, 1);
+
+        l.split(SplitDir::Horizontal);
+        assert!(!l.close(99)); // 越界
+        assert_eq!(l.count, 2);
+    }
+
+    #[test]
+    fn close_decrements_count_and_reports_success() {
+        let mut l = PaneLayout::default();
+        l.split(SplitDir::Horizontal);
+        l.split(SplitDir::Horizontal);
+        assert_eq!(l.count, 3);
+        assert!(l.close(1));
+        assert_eq!(l.count, 2);
+    }
+
+    // —— AppState 拆分/关闭/激活 ——
+
+    #[test]
+    fn ensure_panes_creates_panes_up_to_layout_count() {
+        let mut s = AppState::default();
+        assert!(s.panes.is_empty());
+
+        s.ensure_panes();
+        assert_eq!(s.panes.len(), 1); // 默认 count=1
+
+        s.pane_layout.count = 3;
+        s.ensure_panes();
+        assert_eq!(s.panes.len(), 3);
+    }
+
+    #[test]
+    fn ensure_panes_clamps_active_pane_when_out_of_range() {
+        let mut s = AppState::default();
+        s.pane_layout.count = 2;
+        s.ensure_panes();
+        s.active_pane = 99; // 人为越界
+        s.ensure_panes();
+        assert_eq!(s.active_pane, s.panes.len() - 1);
+    }
+
+    #[test]
+    fn split_pane_activates_new_pane_and_syncs_mirror() {
+        let mut s = ready_state();
+        s.panes[0].wrap = true;
+
+        s.split_pane(SplitDir::Horizontal);
+        assert_eq!(s.pane_layout.count, 2);
+        assert_eq!(s.panes.len(), 2);
+        assert_eq!(s.active_pane, 1); // 新面板成为活动面板
+        assert!(!s.wrap); // 镜像已同步到新面板（默认 false）
+    }
+
+    #[test]
+    fn close_pane_removes_and_reassigns_activity() {
+        let mut s = ready_state();
+        s.split_pane(SplitDir::Horizontal);
+        s.split_pane(SplitDir::Horizontal);
+        assert_eq!(s.panes.len(), 3);
+
+        // 关闭非活动面板（0）：活动面板下标前移修正。
+        s.active_pane = 2;
+        s.close_pane(0);
+        assert_eq!(s.panes.len(), 2);
+        assert_eq!(s.active_pane, 1);
+
+        // 关闭当前活动面板：活动权交给前一个（clamp 到最后一个）。
+        s.close_pane(1);
+        assert_eq!(s.panes.len(), 1);
+        assert_eq!(s.active_pane, 0);
+    }
+
+    #[test]
+    fn close_pane_never_closes_last_pane() {
+        let mut s = ready_state();
+        s.close_pane(0);
+        assert_eq!(s.panes.len(), 1); // 仍保留一个
+        assert_eq!(s.pane_layout.count, 1);
+    }
+
+    #[test]
+    fn active_pane_mut_falls_back_to_last_on_overflow() {
+        let mut s = ready_state();
+        s.split_pane(SplitDir::Horizontal);
+        assert_eq!(s.panes.len(), 2);
+
+        s.active_pane = usize::MAX; // 越界
+        s.active_pane_mut().wrap = true;
+        assert!(s.panes[1].wrap); // 回退到最后一个面板（min(len-1)）
+        assert!(!s.panes[0].wrap);
+    }
+
+    #[test]
+    fn active_pane_returns_none_when_empty() {
+        let s = AppState::default();
+        assert!(s.active_pane().is_none());
+    }
+
+    // —— 镜像同步 ——
+
+    #[test]
+    fn sync_active_pane_mirror_copies_view_state_to_top_level() {
+        let mut s = ready_state();
+        s.split_pane(SplitDir::Horizontal);
+        s.panes[1].wrap = true;
+        s.panes[1].selected_row = Some(42);
+        s.panes[1].max_line_width = 128.0;
+        s.panes[1].in_result_mode = true;
+
+        s.active_pane = 1;
+        s.sync_active_pane_mirror();
+
+        assert!(s.wrap);
+        assert_eq!(s.selected_row, Some(42));
+        assert_eq!(s.max_line_width, 128.0);
+        assert!(s.in_result_mode);
+    }
+
+    #[test]
+    fn sync_active_pane_mirror_clears_when_no_panes() {
+        let mut s = AppState {
+            wrap: true,
+            selected_row: Some(7),
+            max_line_width: 99.0,
+            in_result_mode: true,
+            ..Default::default()
+        };
+
+        s.sync_active_pane_mirror();
+
+        assert!(!s.wrap);
+        assert_eq!(s.selected_row, None);
+        assert_eq!(s.max_line_width, 0.0);
+        assert!(!s.in_result_mode);
+    }
+
+    #[test]
+    fn apply_wrap_writes_mirror_back_to_active_pane() {
+        let mut s = ready_state();
+        s.split_pane(SplitDir::Horizontal);
+        s.active_pane = 1;
+        s.wrap = true;
+        s.apply_wrap_to_active_pane();
+        assert!(s.panes[1].wrap);
+        assert!(!s.panes[0].wrap); // 只影响活动面板
+    }
+
+    // —— 跳转与清态 ——
+
+    #[test]
+    fn jump_to_row_targets_only_active_pane() {
+        let mut s = ready_state();
+        s.split_pane(SplitDir::Horizontal);
+        s.active_pane = 1;
+
+        s.jump_to_row(100);
+        assert_eq!(s.panes[1].scroll_target, Some(100));
+        assert_eq!(s.panes[0].scroll_target, None);
+    }
+
+    #[test]
+    fn clear_pane_view_states_resets_every_pane_and_drops_overrides() {
+        let mut s = ready_state();
+        s.split_pane(SplitDir::Horizontal);
+        s.split_pane(SplitDir::Horizontal);
+        // 给每个面板填上状态（含一个单独文件集）。
+        for (i, p) in s.panes.iter_mut().enumerate() {
+            p.selected_row = Some(i);
+            p.scroll_target = Some(i * 10);
+            p.max_line_width = 1.0;
+            if i == 1 {
+                p.fileset_override = Some(FileSet::new());
+            }
+        }
+
+        s.clear_pane_view_states();
+        for p in &s.panes {
+            assert_eq!(p.selected_row, None);
+            assert_eq!(p.scroll_target, None);
+            assert_eq!(p.max_line_width, 0.0);
+            assert!(p.fileset_override.is_none());
+        }
+    }
+
+    // —— 矩形二等分（布局几何） ——
+
+    #[test]
+    fn halve_horizontal_splits_left_right_at_midpoint() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 50.0));
+        let (l, r) = halve(rect, SplitDir::Horizontal);
+        assert_eq!(l.width(), 50.0);
+        assert_eq!(r.width(), 50.0);
+        assert_eq!(l.height(), 50.0);
+        assert_eq!(r.height(), 50.0);
+        assert_eq!(l.right(), r.left()); // 无缝拼接
+    }
+
+    #[test]
+    fn halve_vertical_splits_top_bottom_at_midpoint() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 50.0));
+        let (t, b) = halve(rect, SplitDir::Vertical);
+        assert_eq!(t.height(), 25.0);
+        assert_eq!(b.height(), 25.0);
+        assert_eq!(t.width(), 100.0);
+        assert_eq!(b.width(), 100.0);
+        assert_eq!(t.bottom(), b.top()); // 无缝拼接
     }
 }
