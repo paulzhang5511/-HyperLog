@@ -347,6 +347,99 @@ impl AppState {
         let wrap = self.wrap;
         self.active_pane_mut().wrap = wrap;
     }
+
+    /// 把一批路径加载到**活动面板**（写入 `fileset_override`，与全局文件集脱钩）。
+    ///
+    /// 复用 `load_paths` 的校验（空文件跳过、32GB 上限），但只影响活动面板的视图，
+    /// 其余面板与全局 `fileset` 保持不变。拆分面板后，普通「打开文件」走此路径，
+    /// 使两个面板可分别显示不同文件（spec §7.7.7）。
+    pub fn open_paths_to_active_pane(&mut self, paths: Vec<PathBuf>) {
+        let mut opened: Vec<Arc<LogFileIndex>> = Vec::new();
+        let mut bytes_total: u64 = 0;
+        let mut loaded = 0usize;
+        let mut skipped = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+
+        for path in paths {
+            let bytes = match std::fs::metadata(&path).map(|m| m.len()) {
+                Ok(b) => b,
+                Err(e) => {
+                    skipped += 1;
+                    errors.push(format!("{}: {e}", path.display()));
+                    continue;
+                }
+            };
+            if bytes_total + bytes > 32 * 1024 * 1024 * 1024 {
+                skipped += 1;
+                errors.push(format!(
+                    "{}: 累计超过 {} 上限，已跳过",
+                    path.display(),
+                    crate::util::human_bytes(32 * 1024 * 1024 * 1024)
+                ));
+                continue;
+            }
+            match LogFileIndex::open(&path) {
+                Ok(idx) => {
+                    bytes_total += bytes;
+                    opened.push(Arc::new(idx));
+                    self.recents.push(path.clone());
+                    loaded += 1;
+                }
+                Err(IndexError::Empty(_)) => {
+                    skipped += 1;
+                    errors.push(format!("{}: 空文件，已跳过", path.display()));
+                }
+                Err(e) => {
+                    skipped += 1;
+                    errors.push(format!("{e}"));
+                }
+            }
+        }
+
+        if loaded == 0 {
+            let tail = errors.join("；");
+            self.status_text = if errors.is_empty() {
+                "未选择文件".to_owned()
+            } else {
+                format!("未加载任何文件（跳过 {skipped}）；{tail}")
+            };
+            return;
+        }
+
+        self.recents.save();
+
+        let mut fs = crate::core::indexer::FileSet::default();
+        for idx in opened {
+            fs.push(idx);
+        }
+
+        // 只替换活动面板的视图：旧行号坐标失效，清该面板视图态（不碰全局 fileset/其他面板）。
+        let pane_idx = self.active_pane;
+        let pane = &mut self.panes[pane_idx];
+        pane.fileset_override = Some(fs);
+        pane.selected_row = None;
+        pane.scroll_target = None;
+        pane.max_line_width = 0.0; // 惰性重算
+        self.sync_active_pane_mirror();
+
+        let total = self.panes[pane_idx]
+            .fileset_override
+            .as_ref()
+            .map(|f| f.total_lines())
+            .unwrap_or(0);
+        self.status_text = if errors.is_empty() {
+            format!(
+                "面板 {} 已打开 {loaded} 个文件，共 {total} 行",
+                pane_idx + 1
+            )
+        } else {
+            let tail = errors.join("；");
+            format!(
+                "面板 {} 已打开 {loaded} 个文件（跳过 {skipped}），共 {total} 行；{tail}",
+                pane_idx + 1
+            )
+        };
+    }
 }
 
 pub struct LogViewerApp {
@@ -548,7 +641,7 @@ impl LogViewerApp {
             return;
         };
 
-        self.load_paths(paths);
+        self.open_paths(paths);
     }
 
     /// 通过系统原生对话框选择目录，递归收集目录下的日志文件并批量加载（Q「打开目录」）。
@@ -570,7 +663,20 @@ impl LogViewerApp {
             );
             return;
         }
-        self.load_paths(files);
+        self.open_paths(files);
+    }
+
+    /// 打开一批路径的**入口**：决定加载到全局文件集还是活动面板。
+    ///
+    /// - 未拆分（`pane_layout.count == 1`）：与旧行为一致，全局替换 `fileset`。
+    /// - 已拆分（≥2 面板）：加载到**活动面板**的 `fileset_override`，两个面板可分别显示
+    ///   不同文件，便于对比（spec §7.7.7）。
+    fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        if self.state.pane_layout.count <= 1 {
+            self.load_paths(paths);
+        } else {
+            self.state.open_paths_to_active_pane(paths);
+        }
     }
 
     /// 加载一批路径：文件对话框与「最近文件」共用同一套校验与提示逻辑（M11）。
@@ -1818,5 +1924,75 @@ mod tests {
         assert_eq!(t.width(), 100.0);
         assert_eq!(b.width(), 100.0);
         assert_eq!(t.bottom(), b.top()); // 无缝拼接
+    }
+
+    // —— 打开路径的分流（open_paths） ——
+
+    /// 测试辅助：在 `target/` 下建一个非空日志文件，返回路径。
+    fn tmp_log(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("hyper-log-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, format!("line one\nline two\n{name}\n")).unwrap();
+        p
+    }
+
+    #[test]
+    fn open_paths_to_active_pane_loads_into_active_pane_override() {
+        let mut s = ready_state();
+        s.split_pane(SplitDir::Horizontal);
+        assert_eq!(s.panes.len(), 2);
+        assert_eq!(s.active_pane, 1); // 拆分后新面板即活动面板
+
+        let p = tmp_log("a.log");
+        s.open_paths_to_active_pane(vec![p.clone()]);
+        // 全局文件集保持不变，活动面板(1)拿到 override。
+        assert_eq!(s.fileset.file_count(), 0);
+        assert!(s.panes[0].fileset_override.is_none());
+        let ov = s.panes[1].fileset_override.as_ref().unwrap();
+        assert_eq!(ov.file_count(), 1);
+        assert_eq!(ov.file(0).unwrap().path, p);
+    }
+
+    #[test]
+    fn open_paths_to_active_pane_twice_gives_two_panes_different_files() {
+        let mut s = ready_state();
+        s.split_pane(SplitDir::Horizontal);
+        assert_eq!(s.active_pane, 1);
+
+        let pa = tmp_log("a.log");
+        let pb = tmp_log("b.log");
+
+        // 第一次打开 → 活动面板(1)
+        s.open_paths_to_active_pane(vec![pa.clone()]);
+        assert_eq!(
+            s.panes[1]
+                .fileset_override
+                .as_ref()
+                .unwrap()
+                .file(0)
+                .unwrap()
+                .path,
+            pa
+        );
+
+        // 激活面板 0，再打开 → 面板 0 拿到不同文件
+        s.active_pane = 0;
+        s.open_paths_to_active_pane(vec![pb.clone()]);
+        assert_eq!(
+            s.panes[0]
+                .fileset_override
+                .as_ref()
+                .unwrap()
+                .file(0)
+                .unwrap()
+                .path,
+            pb
+        );
+
+        // 两个面板的文件集互不相同
+        let a = s.panes[0].fileset_override.as_ref().unwrap();
+        let b = s.panes[1].fileset_override.as_ref().unwrap();
+        assert_ne!(a.file(0).unwrap().path, b.file(0).unwrap().path);
     }
 }

@@ -608,6 +608,11 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
   「本面板打开」按钮（写 `fileset_override`，把单个文件单独载入此面板，与全局文件集脱钩，便于对比两份不同日志）、
   已单独打开的面板显示「共享」按钮返回全局文件集、关闭按钮（`count > 1` 时可关）。
   点击标题条或正文行即激活该面板（标题条高亮 + 描边）。
+- **「打开文件 / 打开目录」按活动面板分流**：普通打开走 `open_paths` 入口——
+  未拆分（`count == 1`）时保持旧语义，全局替换 `fileset`（`load_paths`）；
+  已拆分（`count >= 2`）时调用 `open_paths_to_active_pane`，把文件写入**活动面板**的
+  `fileset_override`，其余面板与全局 `fileset` 不变。这样「第一次打开进面板 1、激活面板 2 再打开
+  进面板 2」，两个面板即可分别显示不同文件，直接满足对比需求。
 - `load_paths` / `reload_all` 清视图态时**遍历所有面板**；`fileset_override` 一并清空（文档已换，
   旧坐标失效）。
 - 拆分状态（`dir` / `count`）写入 `Prefs` 持久化。
@@ -1038,3 +1043,5 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-05 | ① **支持无后缀日志文件**：`dirscan::is_log_file` 由「仅 .log/.txt/.out」改为「扩展名为日志类型**或无扩展名**即视为日志候选」；`app.rs::open_files` 文件对话框新增「所有文件 (*)」过滤器；`open_directory`/`grepdir` 提示同步。新增 fixture `tests/fixtures/no_extension` 与单测 `no_extension_file_is_indexed_normally`。② **命令行支持打开目录**：`App::expand_initial_paths` 在 `new()` 中把初始路径里的目录递归展开为日志文件（复用 `dirscan`），使 `hyper-log <dir>` 与「打开目录」等价，§7.7.1 补契约。③ **滚动方向锁定**：修「上下滑动时正文左右漂移」——egui `ScrollArea` 对 x/y 独立累加 delta 无主控方向判定，`lock_scroll_axis` 按 `AXIS_LOCK_RATIO=0.3` 清零次要分量，纯逻辑抽 `locked_scroll_delta` 并补 4 个单测。§7.7 补契约。单测 58→63，门禁 fmt/clippy(-D warnings)/窗口冒烟 ALIVE 均绿 | Agent |
 | 2026-09-05 | 发布 0.0.4：版本号 `Cargo.toml`/`Cargo.lock`/`docs/prd.md` 0.0.3→0.0.4。本版本相对 0.0.3 的变更：① 支持无后缀日志文件（目录扫描/查找全部纳入无扩展名文件，单文件对话框加「所有文件 (*)」过滤器）；② 命令行支持直接传目录（递归展开为日志文件）；③ 修复触控板上下滑动时正文左右漂移（滚动方向锁定）；④ 查找结果浮动窗口可移动、宽度取主窗口 80% | Agent |
 | 2026-09-06 | M18 拆分面板对比视图（参考 VSCode 编辑器组，spec §7.7.7）：① **数据模型**——抽出 `PaneState`（`fileset_override`/`selected_row`/`scroll_target`/`wrap`/`max_line_width`/`in_result_mode`），每面板独立持有视图态；`AppState` 删全局 `wrap`/`selected_row`/`scroll_target`/`max_line_width`，改加 `panes: Vec<PaneState>`、`pane_layout: PaneLayout{dir,count}`、`active_pane`；`PaneLayout.dir` 为 `SplitDir{Horizontal,Vertical}`、`MAX_PANES=4`（count==4 渲染 2×2 网格）；拆分状态（`split_dir`/`split_count`，clamp 1..=4）写入 `Prefs` 持久化。② **渲染**——egui 只允许一个 `CentralPanel`，拆分在其内部用 `ui.new_child(UiBuilder{max_rect,..})` 手工切分矩形（egui 0.36 已移除 `child_ui`/`allocate_ui_at_rect`）；`log_view::show` 签名改 `(ui, &AppState, &mut PaneState, pane_id)`，两处「先到先得」全局消费改按面板隔离（`scroll_target` 用 `take()`、⌘C 复制加活动面板守卫）。③ **交互**——`active_pane` 标记活动面板（点击标题条/正文即激活并高亮）；工具栏新增拆分方向/关闭面板按钮；每面板标题栏含「本面板打开」（写 `fileset_override` 单独载入文件，与全局文件集脱钩，便于对比两份不同日志）、「共享」（返回全局文件集）、「关闭」（count>1 可关）；侧边栏跳转/⌘L/查找结果跳转只作用于活动面板；`load_paths`/`reload_all` 清态时遍历所有面板并清空 `fileset_override`。④ egui 0.36 API 修正：`child_ui`→`new_child(UiBuilder)`、`available_rect_before_put`→`available_rect_before_wrap`。门禁 fmt/clippy(-D warnings)/63 单测全绿 | Agent |
+| 2026-09-06 | 修复**拆分面板打开文件后正文不显示**：标题条用 `Frame::show` 包裹时，`Frame::begin` 把整个面板高度作为 content_ui 的 max_rect，垂直居中的 `selectable_label` 把 min_rect 撑满整高，`Frame::end` 把父 ui cursor 推到面板底部 → 正文 `available_height` 归零、`ScrollArea` 不渲染。改为标题条用 `horizontal` 手动布局（自然高度）+ `painter.rect_filled` 画背景，正文取剩余矩形 `new_child` 撑满。同时新增拆分面板纯逻辑单测 20 个（单测 63→83），并修正 `active_pane_mut` 注释（实现是 `min(len-1)` 回退到**最后一个**，非「第一个」）。门禁 fmt/clippy(-D warnings)/83 单测全绿 | Agent |
+| 2026-09-06 | 修复**两个面板显示相同内容**：普通「打开文件/打开目录」此前走 `load_paths` 全局替换，拆分后两个面板都显示同一 `fileset`。改为按活动面板分流——`open_paths` 入口：未拆分（`count==1`）保持旧语义全局替换；已拆分（`count>=2`）调用新增的 `AppState::open_paths_to_active_pane`，把文件写入**活动面板**的 `fileset_override`（其余面板与全局 `fileset` 不变）。这样「打开→面板 1、激活面板 2 再打开→面板 2」，两面板可分别显示不同文件。新增 2 个单测（83→85），§7.7.7 补「打开文件按活动面板分流」契约 | Agent |
