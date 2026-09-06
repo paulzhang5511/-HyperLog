@@ -36,6 +36,13 @@ const SAMPLE_LINES: usize = 20_000;
 /// 正文就会在上下滑动的同时左右漂移。取 0.3 表示「垂直分量比水平大 3 倍以上才算纯垂直」。
 const AXIS_LOCK_RATIO: f32 = 0.3;
 
+/// 批量复制的行数上限。
+///
+/// 日志可达上亿行，⌘A 全选后若整段拼接进剪贴板会瞬间吃光内存（1 亿行 × 100B ≈ 10GB）。
+/// 超过上限只复制区间的前 N 行并打 `warn` 日志。VS Code 无此限制（源码行数有限），
+/// 但日志查看器必须设防。
+const MAX_COPY_ROWS: usize = 100_000;
+
 /// 按主控方向裁剪滚动增量：垂直占优时丢弃水平分量，水平占优时丢弃垂直分量。
 ///
 /// 抽成纯函数以便单测（不依赖 `egui::Ui`）。
@@ -156,7 +163,7 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
         f32::INFINITY
     };
 
-    let mut clicked: Option<usize> = None;
+    let mut clicked: Option<(usize, bool)> = None;
     let mut copied: Option<String> = None;
 
     let out = egui::ScrollArea::both()
@@ -167,7 +174,9 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
             for row in range {
                 let (line, gutter_text) = row_content(state, fileset, row, in_result);
                 let text = truncate_for_render(&line);
-                let selected = pane.selected_row == Some(row);
+                // 多选时整个区间都高亮（锚点模型见 `PaneState::selection_anchor`）。
+                let selected = pane.is_row_selected(row);
+                let is_cursor = pane.selected_row == Some(row);
 
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -178,7 +187,7 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
                     );
 
                     // 1) 行背景与行号：先画，位于文本之下
-                    paint_row_bg(ui, row_rect, gutter_w, &gutter_text, selected, p);
+                    paint_row_bg(ui, row_rect, gutter_w, &gutter_text, selected, is_cursor, p);
 
                     // 2) 行号槽：可点击选中整行
                     let (_, gutter_resp) =
@@ -199,12 +208,30 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
                         )
                         .inner;
 
-                    // 4) 点击选中行、右键复制该行
+                    // 4) 点击选中行、右键复制（Shift+点击 = 扩展选区到该行）
                     let resp = gutter_resp.union(text_resp);
                     if resp.clicked() {
-                        clicked = Some(row);
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        clicked = Some((row, shift));
                     }
                     resp.context_menu(|ui| {
+                        let n = pane.selected_count();
+                        // 多行选中时优先提供「复制选中」，单行时只给「复制此行」。
+                        if n > 1 {
+                            let label = if n > MAX_COPY_ROWS {
+                                format!("复制选中行（前 {MAX_COPY_ROWS} 行，共 {n}）")
+                            } else {
+                                format!("复制选中的 {n} 行")
+                            };
+                            if ui.button(label).clicked() {
+                                if let Some((s, e)) = pane.selected_range() {
+                                    copied = Some(collect_selected_rows(
+                                        state, fileset, s, e, in_result,
+                                    ));
+                                }
+                                ui.close();
+                            }
+                        }
                         if ui.button("复制此行").clicked() {
                             copied = Some(text.to_string());
                             ui.close();
@@ -225,24 +252,109 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
         st.store(ui.ctx(), out.id);
     }
 
-    if let Some(r) = clicked {
-        pane.selected_row = Some(r);
+    if let Some((row, shift)) = clicked {
+        if shift {
+            pane.extend_selection_to(row);
+        } else {
+            pane.select_single(row);
+        }
     }
     if let Some(t) = copied {
         ui.ctx().copy_text(t);
     }
 
-    // ⌘C / Ctrl+C 复制选中行（编辑器习惯）。检索框获得焦点时由 TextEdit 先消费该快捷键。
-    // 仅**活动面板**响应：多个面板各自调用 `show`，若都不加区分，`consume_shortcut` 会被先渲染的
-    // 面板一次性消费掉，导致后面的面板永远收不到（spec §7.7.7 的「先到先得」问题）。
-    let copy_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C);
-    if pane_id == state.active_pane
-        && ui.input_mut(|i| i.consume_shortcut(&copy_shortcut))
-        && let Some(row) = pane.selected_row
-    {
-        ui.ctx()
-            .copy_text(row_content(state, fileset, row, in_result).0.into_owned());
+    // 仅**活动面板**响应快捷键：多个面板各自调用 `show`，若不加区分，`consume_shortcut`
+    // 会被先渲染的面板一次性消费掉，后面的面板永远收不到（spec §7.7.7「先到先得」问题）。
+    let is_active = pane_id == state.active_pane;
+
+    // ⌘A 全选：锚点置 0、主选中行置末行。上亿行也只是两个 `usize`。
+    // 检索框聚焦时 TextEdit 会先消费该快捷键（顶栏先渲染），不会走到这里。
+    let select_all = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A);
+    if is_active && ui.input_mut(|i| i.consume_shortcut(&select_all)) {
+        pane.select_all(total - 1);
     }
+
+    // ⌘C / Ctrl+C 复制选中行（编辑器习惯）。检索框获得焦点时由 TextEdit 先消费该快捷键。
+    // 注意：`fileset` 在上方闭包里已用过，此处重新派生一份不可变借用，避免与前面的
+    // `pane.select_*` 可变借用冲突（Rust 借用检查要求不可变借用不能跨可变借用存活）。
+    let copy_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C);
+    if is_active
+        && ui.input_mut(|i| i.consume_shortcut(&copy_shortcut))
+        && let Some((s, e)) = pane.selected_range()
+    {
+        let fs = pane.fileset_override.as_ref().unwrap_or(&state.fileset);
+        let text = collect_selected_rows(state, fs, s, e, in_result);
+        ui.ctx().copy_text(text);
+    }
+
+    // 键盘导航（VS Code 编辑器风格）：
+    // - ↑/↓ 移动光标行（清空多选锚点），Shift+↑/↓ 扩展选区；
+    // - PageUp/PageDown 整页翻动；Home/End 跳全文首/尾。
+    // 仅活动面板响应（多面板「先到先得」问题，同 ⌘C）。移动后借 `scroll_target` 把目标行滚入可视区。
+    if is_active {
+        let cur = pane.selected_row.unwrap_or(0);
+        let page = (out.inner_rect.height() / row_h).max(1.0) as usize;
+        let nav = |ui: &mut egui::Ui, m: egui::Modifiers, key: egui::Key| {
+            ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(m, key)))
+        };
+        let (target, extend) = if nav(ui, egui::Modifiers::NONE, egui::Key::ArrowDown) {
+            (cur.saturating_add(1).min(total - 1), false)
+        } else if nav(ui, egui::Modifiers::NONE, egui::Key::ArrowUp) {
+            (cur.saturating_sub(1), false)
+        } else if nav(ui, egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+            (cur.saturating_add(1).min(total - 1), true)
+        } else if nav(ui, egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+            (cur.saturating_sub(1), true)
+        } else if nav(ui, egui::Modifiers::NONE, egui::Key::PageDown) {
+            (cur.saturating_add(page).min(total - 1), false)
+        } else if nav(ui, egui::Modifiers::NONE, egui::Key::PageUp) {
+            (cur.saturating_sub(page), false)
+        } else if nav(ui, egui::Modifiers::NONE, egui::Key::Home) {
+            (0, false)
+        } else if nav(ui, egui::Modifiers::NONE, egui::Key::End) {
+            (total - 1, false)
+        } else {
+            (cur, false)
+        };
+        if target != cur || extend {
+            if extend {
+                pane.extend_selection_to(target);
+            } else {
+                pane.select_single(target);
+            }
+            pane.scroll_target = Some(target);
+        }
+    }
+}
+
+/// 把 `[start, end]` 区间内的行文本用 `\n` 连接，供批量复制使用。
+///
+/// 行数超过 [`MAX_COPY_ROWS`] 时只取前 `MAX_COPY_ROWS` 行（并打 `warn`），
+/// 避免 ⌘A 全选上亿行时把内存吃光。
+fn collect_selected_rows(
+    state: &AppState,
+    fileset: &FileSet,
+    start: usize,
+    end: usize,
+    in_result: bool,
+) -> String {
+    let last = end.min(start.saturating_add(MAX_COPY_ROWS).saturating_sub(1));
+    if last < end {
+        log::warn!(
+            "复制行数 {} 超过上限 {}，只复制前 {} 行",
+            end - start + 1,
+            MAX_COPY_ROWS,
+            MAX_COPY_ROWS
+        );
+    }
+    let mut out = String::with_capacity((last - start + 1) * 64);
+    for r in start..=last {
+        if r > start {
+            out.push('\n');
+        }
+        out.push_str(&row_content(state, fileset, r, in_result).0);
+    }
+    out
 }
 
 /// 取第 `row` 行的文本与行号槽文本。
@@ -268,18 +380,30 @@ fn row_content<'a>(
 }
 
 /// 绘制一行的背景、行号槽与行号。必须在正文 widget 之前调用（Painter 按调用顺序叠放）。
+///
+/// `selected` = 该行处于多选区间内；`is_cursor` = 该行是「光标行」（`selected_row` 主端点）。
+/// 光标行在 VS Code 风里会多一根左侧 accent 竖条、且行号加亮，便于一眼定位。
 fn paint_row_bg(
     ui: &mut egui::Ui,
     row_rect: egui::Rect,
     gutter_w: f32,
     gutter_text: &str,
     selected: bool,
+    is_cursor: bool,
     p: &Palette,
 ) {
     if selected {
         ui.painter().rect_filled(row_rect, 0.0, p.row_active);
     } else if ui.rect_contains_pointer(row_rect) {
         ui.painter().rect_filled(row_rect, 0.0, p.row_hover);
+    }
+    // 光标行：左侧 accent 竖条（VS Code 当前行指示条，~2px）。必须画在 bg 之上、正文之下。
+    if is_cursor {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(row_rect.min, egui::vec2(2.0, row_rect.height())),
+            0.0,
+            p.accent,
+        );
     }
 
     // 行号槽背景 + 与正文之间的竖线
@@ -290,13 +414,19 @@ fn paint_row_bg(
     ui.painter()
         .vline(x, row_rect.y_range(), egui::Stroke::new(1.0, p.gutter_line));
 
-    // 行号：右对齐到行号槽内边距，随行高垂直居中
+    // 行号：右对齐到行号槽内边距，随行高垂直居中。光标行加亮为 text_strong。
     ui.painter().text(
         egui::pos2(x - GUTTER_PAD, row_rect.center().y),
         egui::Align2::RIGHT_CENTER,
         gutter_text,
         egui::FontId::monospace(theme::GUTTER_FONT_SIZE),
-        if selected { p.text } else { p.text_dim },
+        if is_cursor {
+            p.text_strong
+        } else if selected {
+            p.text
+        } else {
+            p.text_dim
+        },
     );
 }
 

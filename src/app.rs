@@ -109,6 +109,13 @@ pub struct PaneState {
     pub fileset_override: Option<FileSet>,
     /// 选中行（全量视图为该文件集的全局行号，命中视图为命中索引）。
     pub selected_row: Option<usize>,
+    /// 多选锚点（`selected_row` 为另一端）。
+    ///
+    /// 选中态用「锚点 + 主选中行」表示一段**闭区间**，而不是保存选中行的集合：
+    /// 日志可达上亿行，全选时若存集合会爆内存，而区间只需两个 `usize`（O(1)）。
+    /// - `None` → 仅 `selected_row` 单行选中；
+    /// - `Some(a)` → 选中 `[min(a, selected_row), max(a, selected_row)]`。
+    pub selection_anchor: Option<usize>,
     /// 待跳转行号，由该面板自己消费（替代原先的全局 `AppState::scroll_target`）。
     pub scroll_target: Option<usize>,
     /// 折行开关（每面板独立）。
@@ -117,6 +124,61 @@ pub struct PaneState {
     pub max_line_width: f32,
     /// 是否显示检索命中视图（可做到「A 面板全量 + B 面板命中」的对比）。
     pub in_result_mode: bool,
+}
+
+impl PaneState {
+    /// 当前选中的**闭区间** `[start, end]`；无选中返回 `None`。
+    ///
+    /// `selection_anchor` 为 `None` 时是单行选中，区间退化为 `[row, row]`。
+    pub fn selected_range(&self) -> Option<(usize, usize)> {
+        let row = self.selected_row?;
+        match self.selection_anchor {
+            Some(a) => Some((a.min(row), a.max(row))),
+            None => Some((row, row)),
+        }
+    }
+
+    /// 第 `row` 行是否处于选中区间内。
+    pub fn is_row_selected(&self, row: usize) -> bool {
+        matches!(self.selected_range(), Some((s, e)) if row >= s && row <= e)
+    }
+
+    /// 选中区间内的行数（单行选中为 1，无选中为 0）。用于菜单文案与复制前预估。
+    pub fn selected_count(&self) -> usize {
+        match self.selected_range() {
+            Some((s, e)) => e - s + 1,
+            None => 0,
+        }
+    }
+
+    /// Shift + 点击：把 `row` 设为选中行并按需设立锚点。
+    ///
+    /// 已有锚点则保留（可继续扩展选区）；否则以原 `selected_row` 为锚点，
+    /// 此前无选中时锚点即 `row` 本身（退化为单行）。
+    pub fn extend_selection_to(&mut self, row: usize) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = self.selected_row;
+        }
+        self.selected_row = Some(row);
+    }
+
+    /// 普通点击：只选中 `row`，清除多选锚点。
+    pub fn select_single(&mut self, row: usize) {
+        self.selected_row = Some(row);
+        self.selection_anchor = None;
+    }
+
+    /// 全选：锚点置 0、主选中行置 `last_row`。上亿行也只有两个 `usize`，不会爆内存。
+    pub fn select_all(&mut self, last_row: usize) {
+        self.selection_anchor = Some(0);
+        self.selected_row = Some(last_row);
+    }
+
+    /// 清空选中态（含锚点）。
+    pub fn clear_selection(&mut self) {
+        self.selected_row = None;
+        self.selection_anchor = None;
+    }
 }
 
 /// 应用的全部可变状态。UI 各面板只借用它的引用，不持有状态本身。
@@ -317,7 +379,7 @@ impl AppState {
     /// 清空所有面板的视图态（文档被替换/重载时调用：旧的行号坐标已失效）。
     pub fn clear_pane_view_states(&mut self) {
         for p in &mut self.panes {
-            p.selected_row = None;
+            p.clear_selection();
             p.scroll_target = None;
             p.max_line_width = 0.0;
             p.fileset_override = None;
@@ -2214,6 +2276,64 @@ mod tests {
             assert_eq!(p.max_line_width, 0.0);
             assert!(p.fileset_override.is_none());
         }
+    }
+
+    // —— 锚点选区模型（selection_anchor + selected_row 表示闭区间） ——
+
+    #[test]
+    fn select_single_is_single_row_and_clears_anchor() {
+        let mut p = PaneState::default();
+        p.select_single(5);
+        assert_eq!(p.selected_row, Some(5));
+        assert_eq!(p.selection_anchor, None);
+        assert_eq!(p.selected_range(), Some((5, 5)));
+        assert!(p.is_row_selected(5));
+        assert!(!p.is_row_selected(4));
+        assert_eq!(p.selected_count(), 1);
+    }
+
+    #[test]
+    fn extend_selection_to_builds_closed_range_both_directions() {
+        let mut p = PaneState::default();
+        p.select_single(2);
+        p.extend_selection_to(5);
+        assert_eq!(p.selected_range(), Some((2, 5)));
+        assert_eq!(p.selected_count(), 4);
+        assert!(p.is_row_selected(2) && p.is_row_selected(3) && p.is_row_selected(5));
+        // 反向扩展（向上）同样正确，区间自动归一化
+        p.extend_selection_to(0);
+        assert_eq!(p.selected_range(), Some((0, 2)));
+        assert_eq!(p.selected_count(), 3);
+    }
+
+    #[test]
+    fn extend_without_prior_selection_stays_single() {
+        let mut p = PaneState::default();
+        p.extend_selection_to(7);
+        assert_eq!(p.selected_row, Some(7));
+        // 无既有选中 → 不设立锚点，退化为单行
+        assert_eq!(p.selection_anchor, None);
+        assert_eq!(p.selected_range(), Some((7, 7)));
+    }
+
+    #[test]
+    fn select_all_spans_full_range() {
+        let mut p = PaneState::default();
+        p.select_all(9);
+        assert_eq!(p.selected_range(), Some((0, 9)));
+        assert_eq!(p.selected_count(), 10);
+        assert!(p.is_row_selected(0) && p.is_row_selected(9));
+    }
+
+    #[test]
+    fn clear_selection_resets_anchor_too() {
+        let mut p = PaneState::default();
+        p.select_all(9);
+        p.clear_selection();
+        assert_eq!(p.selected_row, None);
+        assert_eq!(p.selection_anchor, None);
+        assert_eq!(p.selected_range(), None);
+        assert_eq!(p.selected_count(), 0);
     }
 
     // —— 矩形分割（布局几何） ——
