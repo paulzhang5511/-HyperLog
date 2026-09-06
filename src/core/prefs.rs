@@ -42,13 +42,9 @@ pub struct Prefs {
     pub window_w: f32,
     pub window_h: f32,
     pub recent_searches: Vec<String>,
-    /// 拆分面板数量（1..=4）。超出范围时由 GUI 层 clamp，此处不做校验以便容错解析。
-    pub split_count: usize,
-    /// 拆分方向：`true` = 上下，`false` = 左右。
-    /// 用 `bool` 而非枚举，避免核心层引入 GUI 概念（与 [`ThemePref`] 同样的解耦思路）。
-    pub split_vertical: bool,
     /// 分割比例（第一块占总尺寸的比例，`0.0..=1.0`）。解析时 clamp 到 `[0.15, 0.85]`，
-    /// 避免某面板被拖到不可见后持久化。
+    /// 避免某面板被拖到不可见后持久化。这是唯一持久化的拆分偏好——拆分数与方向是
+    /// 会话内临时状态，启动恒为单面板。
     pub split_ratio: f32,
 }
 
@@ -61,8 +57,6 @@ impl Default for Prefs {
             window_w: 1280.0,
             window_h: 860.0,
             recent_searches: Vec::new(),
-            split_count: 1,
-            split_vertical: false,
             split_ratio: 0.5,
         }
     }
@@ -117,14 +111,10 @@ impl Prefs {
                             prefs.recent_searches.push(s);
                         }
                     }
-                    "split_count" => {
-                        if let Ok(n) = v.trim().parse::<usize>()
-                            && (1..=4).contains(&n)
-                        {
-                            prefs.split_count = n;
-                        }
+                    "split_count" | "split_dir" => {
+                        // 历史键：旧版本曾持久化拆分数与方向；现拆分是会话内临时状态，
+                        // 启动恒为单面板，故忽略这两个键（保留解析以兼容旧配置文件）。
                     }
-                    "split_dir" => prefs.split_vertical = v.trim().eq_ignore_ascii_case("vertical"),
                     "split_ratio" => {
                         if let Ok(r) = v.trim().parse::<f32>() {
                             prefs.split_ratio = r.clamp(0.15, 0.85);
@@ -180,15 +170,6 @@ impl Prefs {
             text.push_str(r);
             text.push('\n');
         }
-        text.push_str(&format!("split_count={}\n", self.split_count.max(1)));
-        text.push_str(&format!(
-            "split_dir={}\n",
-            if self.split_vertical {
-                "vertical"
-            } else {
-                "horizontal"
-            }
-        ));
         text.push_str(&format!(
             "split_ratio={:.4}\n",
             self.split_ratio.clamp(0.15, 0.85)

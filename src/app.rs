@@ -273,9 +273,8 @@ impl AppState {
         let mut p = self.prefs.clone();
         p.wrap = self.wrap;
         p.sidebar_visible = self.show_sidebar;
-        // 拆分布局：数量、方向、分割比例一并持久化（`split_vertical` 用 bool 表达，避免 core 依赖 egui）。
-        p.split_count = self.pane_layout.count;
-        p.split_vertical = self.pane_layout.dir == SplitDir::Vertical;
+        // 仅持久化分割比例（下次拆分时的布局偏好）；拆分数与方向是会话内临时状态，
+        // 启动恒为单面板，故不写盘（见 `LogViewerApp::new` 的固定单面板初始化）。
         p.split_ratio = self.pane_layout.ratio;
         p.save();
     }
@@ -539,14 +538,11 @@ impl LogViewerApp {
         };
         // 回填实时开关（折行/侧栏）：持久化的是唯一真相，实时字段初值取自偏好。
         app.state.show_sidebar = app.state.prefs.sidebar_visible;
-        // 面板：布局（方向/数量）从偏好恢复，并确保 panes 覆盖布局所需数量。
+        // 面板：每次启动固定为**单面板**（拆分是会话内临时状态，不跨启动持久化）。
+        // 仅保留分割比例（用户下次拆分时的布局偏好），方向默认左右、数量恒 1。
         app.state.pane_layout = PaneLayout {
-            dir: if app.state.prefs.split_vertical {
-                SplitDir::Vertical
-            } else {
-                SplitDir::Horizontal
-            },
-            count: app.state.prefs.split_count.clamp(1, MAX_PANES),
+            dir: SplitDir::Horizontal,
+            count: 1,
             ratio: app.state.prefs.split_ratio,
         };
         app.state.ensure_panes();

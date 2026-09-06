@@ -198,9 +198,13 @@ fn style_for(p: &Palette, dark: bool) -> egui::Style {
     v.hyperlink_color = p.accent;
     v.warn_fg_color = p.level_warn;
     v.error_fg_color = p.level_error;
+    // 文本选区：`bg_fill` 是选区底色，`stroke.color` 是**选中文字的颜色**（egui 的
+    // `paint_text_selection` 会把选中文字的顶点色改写为 `selection.stroke.color`）。
+    // 这里必须用与选区底色高对比的 `text_strong`（暗色白 / 亮色近黑），而非 accent 蓝——
+    // 否则选中文字会变成 accent 蓝，蓝字叠在蓝底上，暗色主题对比度仅 1.33:1，双击选词后完全看不清。
     v.selection = egui::style::Selection {
         bg_fill: p.selection,
-        stroke: Stroke::new(1.0, p.accent),
+        stroke: Stroke::new(1.0, p.text_strong),
     };
     // 编辑器没有圆角窗口与阴影，只有菜单保留少量圆角。
     v.window_corner_radius = CornerRadius::ZERO;
@@ -394,6 +398,23 @@ mod tests {
             assert!(
                 ratio >= 4.5,
                 "正文在命中高亮底色上对比度仅 {ratio:.2}:1，低于下限 4.5:1"
+            );
+        }
+    }
+
+    /// 选中文字的颜色必须与选区底色高对比（≥ 4.5:1，WCAG AA）。
+    ///
+    /// 回归守卫：egui 的文本选区（`Label::selectable` 双击选词）会把选中文字的顶点色
+    /// 改写为 `selection.stroke.color`。此处曾误用 accent 蓝（`p.accent`），暗色主题下
+    /// 蓝字叠深蓝底对比度仅 1.33:1，双击选词后文字几乎不可见。故 `stroke.color` 改用
+    /// `text_strong`（暗色白 / 亮色近黑），用本用例锁住两套主题下的高对比不变量。
+    #[test]
+    fn selected_text_is_readable_on_selection_background() {
+        for p in [&DARK, &LIGHT] {
+            let ratio = contrast(p.text_strong, p.selection);
+            assert!(
+                ratio >= 4.5,
+                "选中文字（text_strong）在选区底色上对比度仅 {ratio:.2}:1，低于下限 4.5:1"
             );
         }
     }
