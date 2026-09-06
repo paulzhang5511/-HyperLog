@@ -27,6 +27,15 @@ pub const MAX_PANES: usize = 4;
 /// 固定值也让「先铺背景、再画内容」的绘制顺序（见 `render_one_pane`）易于实现。
 const TITLE_BAR_HEIGHT: f32 = 20.0;
 
+/// 检索命中导航方向（VS Code `F3` = 下一处，`⇧F3` = 上一处）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HitDir {
+    /// 下一个命中（到末尾后回到第一个）。
+    Next,
+    /// 上一个命中（到开头后回到最后一个）。
+    Prev,
+}
+
 /// 拆分方向。
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum SplitDir {
@@ -130,6 +139,12 @@ pub struct PaneState {
     pub max_line_width: f32,
     /// 是否显示检索命中视图（可做到「A 面板全量 + B 面板命中」的对比）。
     pub in_result_mode: bool,
+    /// 最近一次**双击选中的词**（供 `⌘F` 自动带入检索框，VS Code「选词即搜」的轻量版）；
+    /// 空串表示无。
+    ///
+    /// 存在面板上而不是 `AppState`，是因为取词发生在 `log_view::show` 的行渲染闭包里，
+    /// 那里只拿得到 `&mut PaneState`（`state` 是不可变借用，见该函数的借用注释）。
+    pub selected_word: String,
 }
 
 impl PaneState {
@@ -247,6 +262,11 @@ pub struct AppState {
     pub in_result_mode: bool,
     /// 检索中用同一 `Regex` 做命中高亮（G5）。
     pub hit_regex: Option<Regex>,
+    /// 命中导航游标：当前定位到 `search_results` 的第几个（VS Code `F3`/`⇧F3`）。
+    ///
+    /// `None` = 尚未开始导航（首次按 F3 落到第一个命中）。新检索开始或结果被清空时重置，
+    /// 否则游标会指向另一批结果的无意义下标。
+    pub hit_cursor: Option<usize>,
 
     /// toolbar 置位后，在 `ui` 中启动检索。
     pub pending_search: bool,
@@ -287,9 +307,12 @@ pub struct AppState {
     pub sidebar_active_file: Option<usize>,
 
     // —— 用户偏好持久化（spec §1.3 待定 P2，M17）——
-    /// 持久化偏好（主题/窗口几何/折行/侧栏/最近检索词）；实时开关 `wrap`/`show_sidebar`
+    /// 持久化偏好（主题/窗口几何/折行/侧栏/最近检索词/字号）；实时开关 `wrap`/`show_sidebar`
     /// 在保存时同步进本结构后写盘，加载时回填这两个实时字段。
     pub prefs: Prefs,
+    /// 日志正文字号（`⌘+`/`⌘-`/`⌘0` 缩放，持久化在 [`Prefs::font_size`]）。
+    /// 行高与行号槽宽度都按它联动缩放，故改动后必须清空各面板的 `max_line_width` 重算。
+    pub font_size: f32,
     /// 上次写偏好（窗口几何）的时刻（ctx.time，秒），节流到约每 2s 一次避免拖动时频繁写盘。
     pub last_prefs_save: f64,
 
@@ -349,6 +372,7 @@ impl AppState {
         // 仅持久化分割比例（下次拆分时的布局偏好）；拆分数与方向是会话内临时状态，
         // 启动恒为单面板，故不写盘（见 `LogViewerApp::new` 的固定单面板初始化）。
         p.split_ratio = self.pane_layout.ratio;
+        p.font_size = self.font_size;
         p.save();
     }
 
@@ -383,6 +407,75 @@ impl AppState {
         }
     }
 
+    /// 在检索命中之间前/后导航（VS Code `F3` / `⇧F3`）。
+    ///
+    /// 活动面板在命中视图时按**命中索引**定位，在全量视图时换算成**全局行号**
+    /// （`file_global_start + line_idx`），这样 F3 在全量日志里也能带着上下文跳到那一行。
+    /// 两端环绕（最后一个之后回到第一个）。无命中时返回 `false` 且不改状态。
+    pub fn goto_hit(&mut self, dir: HitDir) -> bool {
+        let total = self.search_results.len();
+        if total == 0 {
+            return false;
+        }
+        let idx = match (dir, self.hit_cursor) {
+            (HitDir::Next, None) => 0,
+            (HitDir::Next, Some(c)) => (c + 1) % total,
+            (HitDir::Prev, None) => total - 1,
+            // 结果可能比游标短（重搜后命中变少），先夹取再减，避免下溢 panic。
+            (HitDir::Prev, Some(c)) if c == 0 || c > total => total - 1,
+            (HitDir::Prev, Some(c)) => c - 1,
+        };
+        self.hit_cursor = Some(idx);
+
+        let hit = self.search_results[idx];
+        let global_row = self
+            .fileset
+            .file_global_start(hit.file_idx as usize)
+            .map(|start| start + hit.line_idx as usize);
+        let pane = self.active_pane_mut();
+        // 命中视图下 `selected_row` 的语义是命中索引，全量视图下才是全局行号。
+        let target = if pane.in_result_mode {
+            idx
+        } else {
+            global_row.unwrap_or(idx)
+        };
+        pane.select_single(target);
+        pane.scroll_target = Some(target);
+        self.selected_row = Some(target); // 顶层镜像（状态栏/快捷键读它）
+        true
+    }
+
+    /// 按增量缩放正文字号（`⌘+` / `⌘-`），夹取到合法范围。
+    pub fn zoom_font(&mut self, delta: f32) {
+        self.set_font_size(self.font_size + delta);
+    }
+
+    /// 设置正文字号并落盘。
+    ///
+    /// 行高与行号槽宽度都由字号派生，故必须清空各面板的 `max_line_width` 让它惰性重算，
+    /// 否则横向滚动范围还停留在旧字号下的估算值（表现为右侧滚不到底或滚动条过长）。
+    pub fn set_font_size(&mut self, size: f32) {
+        let size = size.clamp(
+            crate::core::prefs::MIN_FONT_SIZE,
+            crate::core::prefs::MAX_FONT_SIZE,
+        );
+        if (size - self.font_size).abs() < f32::EPSILON {
+            return;
+        }
+        self.font_size = size;
+        self.prefs.font_size = size;
+        for p in &mut self.panes {
+            p.max_line_width = 0.0;
+        }
+        self.max_line_width = 0.0;
+        self.save_prefs();
+    }
+
+    /// 恢复默认字号（`⌘0`）。
+    pub fn reset_font_size(&mut self) {
+        self.set_font_size(crate::core::prefs::DEFAULT_FONT_SIZE);
+    }
+
     /// 清空所有面板的视图态（文档被替换/重载时调用：旧的行号坐标已失效）。
     pub fn clear_pane_view_states(&mut self) {
         for p in &mut self.panes {
@@ -390,6 +483,7 @@ impl AppState {
             p.scroll_target = None;
             p.max_line_width = 0.0;
             p.fileset_override = None;
+            p.selected_word.clear(); // 旧文档的词已无意义，别被 ⌘F 带入新检索
         }
     }
 
@@ -423,6 +517,7 @@ impl AppState {
         self.search_truncated = false;
         self.search_error = None;
         self.hit_regex = None;
+        self.hit_cursor = None;
         // 视图态是每面板独立持有的，必须遍历清空（含各面板单独打开的文件集）。
         self.clear_pane_view_states();
         self.selected_row = None;
@@ -632,6 +727,11 @@ impl LogViewerApp {
         };
         // 回填实时开关（折行/侧栏）：持久化的是唯一真相，实时字段初值取自偏好。
         app.state.show_sidebar = app.state.prefs.sidebar_visible;
+        // 正文字号同理取自偏好（`⌘+`/`⌘-` 缩放后落盘）。
+        app.state.font_size = app.state.prefs.font_size.clamp(
+            crate::core::prefs::MIN_FONT_SIZE,
+            crate::core::prefs::MAX_FONT_SIZE,
+        );
         // 面板：每次启动固定为**单面板**（拆分是会话内临时状态，不跨启动持久化）。
         // 仅保留分割比例（用户下次拆分时的布局偏好），方向默认左右、数量恒 1。
         app.state.pane_layout = PaneLayout {
@@ -695,6 +795,16 @@ impl LogViewerApp {
             self.state.pending_open_dir = true;
         }
         if pressed(ctx, cmd, egui::Key::F) {
+            // 双击选过词就把它带入检索框——VS Code「⌘F 带入选中文本」的轻量版：
+            // egui 拿不到 Label 选区文本，故由 `log_view` 在双击时按点击位置反查词并存进面板。
+            let word = self
+                .state
+                .active_pane()
+                .map(|p| p.selected_word.clone())
+                .unwrap_or_default();
+            if !word.is_empty() {
+                self.state.search_pattern = word;
+            }
             self.state.focus_search = true;
         }
         if pressed(ctx, cmd, egui::Key::L) {
@@ -704,12 +814,40 @@ impl LogViewerApp {
             self.state.show_sidebar = !self.state.show_sidebar;
             self.state.save_prefs();
         }
-        // ⌘G / ⌘↵：触发检索（等价「查找」按钮）
-        if (pressed(ctx, cmd, egui::Key::G) || pressed(ctx, cmd, egui::Key::Enter))
+        // ⇧⌘G / ⌘G：在命中之间导航（VS Code Find Previous / Next）。
+        // 先判 ⇧⌘G：egui 的 `Modifiers::matches` 是「包含」语义，⌘G 也会匹配 ⇧⌘G 的按键，
+        // 反过来则不会；且 `consume_shortcut` 会摘掉该事件，前者命中后后者本帧不再触发。
+        if pressed(ctx, cmd_shift, egui::Key::G) {
+            self.state.goto_hit(HitDir::Prev);
+        } else if (pressed(ctx, cmd, egui::Key::G) || pressed(ctx, cmd, egui::Key::Enter))
             && !self.state.is_searching
-            && !self.state.search_pattern.trim().is_empty()
         {
-            self.state.pending_search = true;
+            if self.state.search_results.is_empty() {
+                // 还没检索过：⌘G / ⌘↵ 仍等价「查找」按钮（旧行为）。
+                if !self.state.search_pattern.trim().is_empty() {
+                    self.state.pending_search = true;
+                }
+            } else {
+                self.state.goto_hit(HitDir::Next);
+            }
+        }
+        // F3 / ⇧F3：命中导航（Windows/Linux 惯用的 Find Next / Previous）。
+        // 用 `key_pressed` + `modifiers.shift` 判断方向，避免 `consume_shortcut` 的
+        // 「包含」语义把无修饰的 F3 也当成 ⇧F3。
+        if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
+            let prev = ctx.input(|i| i.modifiers.shift);
+            self.state
+                .goto_hit(if prev { HitDir::Prev } else { HitDir::Next });
+        }
+        // ⌘+ / ⌘- / ⌘0：正文字号缩放（VS Code 同款），改动即落盘。
+        if pressed(ctx, cmd, egui::Key::Plus) {
+            self.state.zoom_font(1.0);
+        }
+        if pressed(ctx, cmd, egui::Key::Minus) {
+            self.state.zoom_font(-1.0);
+        }
+        if pressed(ctx, cmd, egui::Key::Num0) {
+            self.state.reset_font_size();
         }
         // Esc：退出**活动面板**的命中视图（返回全量日志）；否则清除活动面板选中行。
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -862,6 +1000,7 @@ impl LogViewerApp {
         self.state.search_truncated = false;
         self.state.search_error = None;
         self.state.hit_regex = None;
+        self.state.hit_cursor = None; // 文档换了，旧命中游标失效
         // 视图态是每面板独立持有的，必须遍历清空（含各面板单独打开的文件集）。
         self.state.clear_pane_view_states();
         self.state.selected_row = None;
@@ -869,7 +1008,8 @@ impl LogViewerApp {
         self.state.dirty_files.clear();
 
         // 新文件可能比已加载的更宽，重新估算横向滚动范围（活动面板）。
-        let max_line_width = log_view::estimate_content_width(&self.state.fileset);
+        let max_line_width =
+            log_view::estimate_content_width(&self.state.fileset, self.state.font_size);
         self.state.max_line_width = max_line_width;
         self.state.active_pane_mut().max_line_width = max_line_width;
 
@@ -938,6 +1078,8 @@ impl LogViewerApp {
         self.state.is_searching = true;
         self.state.search_results.clear();
         self.state.search_error = None;
+        // 新的一批结果：旧游标指向的是上一批的下标，必须重置（否则 F3 会跳到无关行）。
+        self.state.hit_cursor = None;
         self.state.search_truncated = false;
         self.state.search_progress = (0, self.state.fileset.total_bytes() as u64);
         // 检索结果视图是「每面板独立」的：发起检索时把**活动面板**切到命中视图，
@@ -2181,6 +2323,77 @@ mod tests {
         assert_eq!(s.fileset.file_count(), 0);
     }
 
+    // —— 命中导航（goto_hit）与字号缩放 ——
+
+    /// 给 `search_results` 填入 N 个命中（file_idx 全部 0，避免依赖 fileset）。
+    fn seed_hits(s: &mut AppState, n: u32) {
+        s.search_results = (0..n)
+            .map(|i| SearchHit {
+                file_idx: 0,
+                line_idx: i,
+            })
+            .collect();
+    }
+
+    #[test]
+    fn goto_hit_wraps_forward_and_backward() {
+        let mut s = ready_state();
+        seed_hits(&mut s, 3);
+
+        // 无游标 → Next 从 0 开始
+        assert!(s.goto_hit(HitDir::Next));
+        assert_eq!(s.hit_cursor, Some(0));
+        assert!(s.goto_hit(HitDir::Next));
+        assert_eq!(s.hit_cursor, Some(1));
+        assert!(s.goto_hit(HitDir::Next));
+        assert_eq!(s.hit_cursor, Some(2));
+        // 末尾再 Next → 环绕回 0
+        assert!(s.goto_hit(HitDir::Next));
+        assert_eq!(s.hit_cursor, Some(0));
+
+        // 无游标 → Prev 从末尾开始
+        s.hit_cursor = None;
+        assert!(s.goto_hit(HitDir::Prev));
+        assert_eq!(s.hit_cursor, Some(2));
+        // 0 再 Prev → 环绕回末尾
+        s.hit_cursor = Some(0);
+        assert!(s.goto_hit(HitDir::Prev));
+        assert_eq!(s.hit_cursor, Some(2));
+    }
+
+    #[test]
+    fn goto_hit_no_results_returns_false() {
+        let mut s = ready_state();
+        assert!(!s.goto_hit(HitDir::Next));
+        assert_eq!(s.hit_cursor, None);
+        assert!(!s.goto_hit(HitDir::Prev));
+    }
+
+    #[test]
+    fn set_font_size_clamps_and_clears_line_width_cache() {
+        let mut s = ready_state();
+        s.panes[0].max_line_width = 1234.5;
+
+        // 超上限 → 夹取到 MAX
+        s.set_font_size(9999.0);
+        assert_eq!(s.font_size, crate::core::prefs::MAX_FONT_SIZE);
+        assert_eq!(s.prefs.font_size, crate::core::prefs::MAX_FONT_SIZE);
+        assert_eq!(s.panes[0].max_line_width, 0.0); // 清缓存
+
+        // 低于下限 → 夹取到 MIN
+        s.set_font_size(0.1);
+        assert_eq!(s.font_size, crate::core::prefs::MIN_FONT_SIZE);
+    }
+
+    #[test]
+    fn reset_font_size_returns_to_default() {
+        let mut s = ready_state();
+        s.set_font_size(18.0);
+        assert_ne!(s.font_size, crate::core::prefs::DEFAULT_FONT_SIZE);
+        s.reset_font_size();
+        assert_eq!(s.font_size, crate::core::prefs::DEFAULT_FONT_SIZE);
+    }
+
     #[test]
     fn active_pane_mut_falls_back_to_last_on_overflow() {
         let mut s = ready_state();
@@ -2388,11 +2601,18 @@ mod tests {
 
     // —— 打开路径的分流（open_paths） ——
 
-    /// 测试辅助：在 `target/` 下建一个非空日志文件，返回路径。
+    /// 测试辅助：在临时目录下建一个非空日志文件，返回**唯一**路径。
+    ///
+    /// 文件名带全局递增序号：并行 `#[test]` 会并发调用本函数，若都用固定名（如 `a.log`），
+    /// 一个线程 `std::fs::write` 截断重写时，另一个线程正 `LogFileIndex::open` 对其 mmap，
+    /// 会撞上空窗读到 0 字节 → `IndexError::Empty` → `loaded==0` 提前 return（flaky）。
     fn tmp_log(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join("hyper-log-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join(name);
+        let p = dir.join(format!("{seq}_{name}"));
         std::fs::write(&p, format!("line one\nline two\n{name}\n")).unwrap();
         p
     }

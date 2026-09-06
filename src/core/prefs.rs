@@ -8,6 +8,14 @@
 
 use std::path::{Path, PathBuf};
 
+/// 日志正文字号的默认与合法范围（`⌘+`/`⌘-`/`⌘0` 缩放）。
+///
+/// 定义在 core 层（而非 `ui::theme`）是因为偏好要能独立持久化/解析，core 禁止依赖 GUI；
+/// `ui::theme::LOG_FONT_SIZE` 与之保持一致，仅作为 GUI 层的回退常量。
+pub const DEFAULT_FONT_SIZE: f32 = 12.5;
+pub const MIN_FONT_SIZE: f32 = 8.0;
+pub const MAX_FONT_SIZE: f32 = 28.0;
+
 /// 主题偏好。与 `egui::Theme` 解耦，在 GUI 层映射。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemePref {
@@ -46,6 +54,9 @@ pub struct Prefs {
     /// 避免某面板被拖到不可见后持久化。这是唯一持久化的拆分偏好——拆分数与方向是
     /// 会话内临时状态，启动恒为单面板。
     pub split_ratio: f32,
+    /// 日志正文字号（`⌘+`/`⌘-`/`⌘0` 缩放），解析时 clamp 到
+    /// `[MIN_FONT_SIZE, MAX_FONT_SIZE]`，避免极端值让行高塌陷或撑爆布局。
+    pub font_size: f32,
 }
 
 impl Default for Prefs {
@@ -58,6 +69,7 @@ impl Default for Prefs {
             window_h: 860.0,
             recent_searches: Vec::new(),
             split_ratio: 0.5,
+            font_size: DEFAULT_FONT_SIZE,
         }
     }
 }
@@ -120,6 +132,11 @@ impl Prefs {
                             prefs.split_ratio = r.clamp(0.15, 0.85);
                         }
                     }
+                    "font_size" => {
+                        if let Ok(s) = v.trim().parse::<f32>() {
+                            prefs.font_size = s.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+                        }
+                    }
                     _ => {} // 未知键忽略
                 }
             }
@@ -173,6 +190,10 @@ impl Prefs {
         text.push_str(&format!(
             "split_ratio={:.4}\n",
             self.split_ratio.clamp(0.15, 0.85)
+        ));
+        text.push_str(&format!(
+            "font_size={:.1}\n",
+            self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
         ));
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text)?;
@@ -265,6 +286,28 @@ mod tests {
         assert!(!loaded.wrap);
         assert_eq!(loaded.window_w, 1280.0);
         assert_eq!(loaded.recent_searches, vec!["ERROR".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn font_size_roundtrips_and_clamps() {
+        let dir = scratch("font");
+        let p = dir.join("prefs.txt");
+        let prefs = Prefs {
+            font_size: 16.0,
+            ..Default::default()
+        };
+        prefs.save_to(&p).unwrap();
+        assert_eq!(Prefs::load_from(&p).font_size, 16.0);
+
+        // 越界值：解析时 clamp 到合法范围，绝不出现 0 或负数行高。
+        std::fs::write(&p, "font_size=999\n").unwrap();
+        assert_eq!(Prefs::load_from(&p).font_size, MAX_FONT_SIZE);
+        std::fs::write(&p, "font_size=-3\n").unwrap();
+        assert_eq!(Prefs::load_from(&p).font_size, MIN_FONT_SIZE);
+        // 损坏值回退默认
+        std::fs::write(&p, "font_size=abc\n").unwrap();
+        assert_eq!(Prefs::load_from(&p).font_size, DEFAULT_FONT_SIZE);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

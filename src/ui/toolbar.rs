@@ -1,4 +1,4 @@
-use crate::app::{AppState, MAX_PANES, SplitDir};
+use crate::app::{AppState, HitDir, MAX_PANES, SplitDir};
 use crate::core::search::SearchMode;
 
 /// 检索输入框的稳定 `Id`（⌘F 快捷键据此聚焦）。
@@ -194,10 +194,32 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             // 命中结果组：仅在存在检索结果时出现（T15：检索中仅禁用 打开/搜索/导出）
             if !state.search_results.is_empty() {
                 ui.separator();
-                ui.weak(format!(
-                    "{} 命中",
-                    crate::util::group_digits(state.search_results.len())
-                ));
+                // 命中计数：导航过就显示「第 N / 共 M 处」（VS Code 的查找计数观感），
+                // 否则退回原来的「N 命中」，避免无导航时凭空多出「第 0 处」的怪异文案。
+                let hits = state.search_results.len();
+                let label = match state.hit_cursor {
+                    Some(c) if hits > 0 => format!(
+                        "第 {} / 共 {} 处",
+                        crate::util::group_digits(c + 1),
+                        crate::util::group_digits(hits)
+                    ),
+                    _ => format!("{} 命中", crate::util::group_digits(hits)),
+                };
+                ui.weak(label);
+                // 命中导航按钮（等价 F3 / ⇧F3）。图标用中文单字而非 Unicode 箭头：
+                // egui 字体链对几何/箭头符号覆盖不可靠，中文由内嵌 MiSans 确定覆盖。
+                if hits > 0 {
+                    if ui
+                        .small_button("上")
+                        .on_hover_text("上一处 (Shift+F3)")
+                        .clicked()
+                    {
+                        state.goto_hit(HitDir::Prev);
+                    }
+                    if ui.small_button("下").on_hover_text("下一处 (F3)").clicked() {
+                        state.goto_hit(HitDir::Next);
+                    }
+                }
                 // 「仅命中」是每面板独立的视图模式：切换只作用于活动面板（spec §7.7.7）。
                 let mut in_res = state
                     .active_pane()

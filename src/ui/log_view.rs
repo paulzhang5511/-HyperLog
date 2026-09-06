@@ -102,6 +102,13 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
         Some(fs) => fs.clone(),
         None => state.fileset.clone(),
     };
+    // 字号由 ⌘+/⌘-/⌘0 缩放（持久化在 prefs）。行高与行号字号都从它派生，
+    // 保证放大后行高、行号槽宽度同步增长，否则文字会挤在一起或被裁切。
+    let font_size = state.font_size;
+    let gutter_size = font_size * (theme::GUTTER_FONT_SIZE / theme::LOG_FONT_SIZE);
+    // 默认字号下行高 18px（12.5px 字 → 1.44 倍行距），缩放时保持同一比例。
+    let row_unit = font_size * (ROW_HEIGHT / theme::LOG_FONT_SIZE);
+
     let total = if in_result {
         state.search_results.len()
     } else {
@@ -136,13 +143,14 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
     } else {
         digits_of(total)
     };
-    let gutter_w = digits as f32 * GUTTER_CHAR_W + GUTTER_PAD * 2.0;
+    let gutter_char_w = GUTTER_CHAR_W * (gutter_size / theme::GUTTER_FONT_SIZE);
+    let gutter_w = digits as f32 * gutter_char_w + GUTTER_PAD * 2.0;
     let avail_text_w = (ui.available_width() - gutter_w - TEXT_PAD * 2.0).max(120.0);
 
     // 横向滚动范围按「估算的最长行」固定：若跟随当前可见行，滚动条长度会随滚动抖动。
     // 首次（max_line_width==0）惰性估算，避免每帧扫描；`load_paths`/`reload` 清零各面板时也会重算。
     if pane.max_line_width <= 0.0 {
-        pane.max_line_width = estimate_content_width(&fileset);
+        pane.max_line_width = estimate_content_width(&fileset, font_size);
     }
     let content_w = pane.max_line_width.max(avail_text_w);
     let (row_h, text_w) = if pane.wrap {
@@ -152,9 +160,9 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
         let lines = (content_w / avail_text_w)
             .ceil()
             .clamp(1.0, MAX_WRAP_LINES as f32);
-        (ROW_HEIGHT * lines, avail_text_w)
+        (row_unit * lines, avail_text_w)
     } else {
-        (ROW_HEIGHT, content_w)
+        (row_unit, content_w)
     };
     ui.style_mut().wrap_mode = Some(if pane.wrap {
         egui::TextWrapMode::Wrap
@@ -194,7 +202,15 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
                     );
 
                     // 1) 行背景与行号：先画，位于文本之下
-                    paint_row_bg(ui, row_rect, gutter_w, &gutter_text, selected, is_cursor, p);
+                    paint_row_bg(
+                        ui,
+                        row_rect,
+                        gutter_w,
+                        &gutter_text,
+                        selected,
+                        is_cursor,
+                        gutter_size,
+                    );
 
                     // 2) 行号槽：可点击选中整行，按住上下拖动 = 连续多选（VS Code 风）。
                     //    `click_and_drag` 同时提供 `drag_started`（按下帧）与 `dragged`/`hovered`（拖动中）。
@@ -229,8 +245,10 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.add(
-                                    egui::Label::new(build_job(&text, &hl, p, wrap_width))
-                                        .selectable(true),
+                                    egui::Label::new(build_job(
+                                        &text, &hl, p, wrap_width, font_size,
+                                    ))
+                                    .selectable(true),
                                 )
                             },
                         )
@@ -241,6 +259,16 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
                     if resp.clicked() {
                         let shift = ui.input(|i| i.modifiers.shift);
                         clicked = Some((row, shift));
+                    }
+                    // 双击取词：供 `⌘F` 自动带入检索框。egui 拿不到 `Label` 的选区文本，
+                    // 故按点击位置反查字符索引，再向两侧扩到词边界（见 `word_at_offset`）。
+                    if resp.double_clicked()
+                        && let Some(pos) = resp.interact_pointer_pos()
+                    {
+                        let x_off = pos.x - (row_rect.min.x + gutter_w + TEXT_PAD);
+                        if let Some(w) = word_at_offset(ui, &text, font_size, x_off) {
+                            pane.selected_word = w;
+                        }
                     }
                     resp.context_menu(|ui| {
                         let n = pane.selected_count();
@@ -446,8 +474,10 @@ fn paint_row_bg(
     gutter_text: &str,
     selected: bool,
     is_cursor: bool,
-    p: &Palette,
+    gutter_size: f32,
 ) {
+    // 色板是进程级常量，从 ctx 取即可，不必每行额外传参。
+    let p = theme::palette(ui.ctx());
     if selected {
         ui.painter().rect_filled(row_rect, 0.0, p.row_active);
     } else if ui.rect_contains_pointer(row_rect) {
@@ -475,7 +505,7 @@ fn paint_row_bg(
         egui::pos2(x - GUTTER_PAD, row_rect.center().y),
         egui::Align2::RIGHT_CENTER,
         gutter_text,
-        egui::FontId::monospace(theme::GUTTER_FONT_SIZE),
+        egui::FontId::monospace(gutter_size),
         if is_cursor {
             p.text_strong
         } else if selected {
@@ -487,10 +517,16 @@ fn paint_row_bg(
 }
 
 /// 把一行的着色分段打包成单个 `LayoutJob`，供一个 `Label` 渲染整行。
-fn build_job(line: &str, hl: &Highlighter, p: &Palette, wrap_width: f32) -> egui::text::LayoutJob {
+fn build_job(
+    line: &str,
+    hl: &Highlighter,
+    p: &Palette,
+    wrap_width: f32,
+    font_size: f32,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
-    let font = egui::FontId::monospace(theme::LOG_FONT_SIZE);
+    let font = egui::FontId::monospace(font_size);
     for seg in crate::highlight::segments(line, hl) {
         let (text, color, background) = match seg {
             Segment::Plain(t) => (t, p.text, Color32::TRANSPARENT),
@@ -565,18 +601,66 @@ fn truncate_for_render(line: &str) -> Cow<'_, str> {
     }
 }
 
+/// 双击时按点击位置（相对行文本起点的 x 偏移）反查字符索引，再取出所在的词。
+///
+/// egui 不暴露 `Label` 的选区文本，故走「排版一次 → 用光标位置求字符索引」的路子：
+/// `Painter::layout_no_wrap` 只需 `&self`（不必 `fonts_mut`），单行排版开销可忽略。
+fn word_at_offset(ui: &mut egui::Ui, line: &str, font_size: f32, x_offset: f32) -> Option<String> {
+    if x_offset < 0.0 {
+        return None;
+    }
+    let galley = ui.painter().layout_no_wrap(
+        line.to_string(),
+        egui::FontId::monospace(font_size),
+        // 只为测量位置，颜色不参与渲染
+        egui::Color32::WHITE,
+    );
+    // `cursor_from_pos` 返回 `CCursor`，其 `.index` 是 `CharIndex`（字符索引），`word_at`
+    // 内部用 `chars[char_idx]` 按字符下标访问，二者一致；`CharIndex` 可 `.into()` 转 usize。
+    let cursor = galley.cursor_from_pos(egui::vec2(x_offset, 0.0));
+    word_at(line, cursor.index.into())
+}
+
+/// 取 `char_idx` 所在的词（向两侧扩到词边界）；落在分隔符上或越界时返回 `None`。
+fn word_at(line: &str, char_idx: usize) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    if char_idx >= chars.len() || !is_word_char(chars[char_idx]) {
+        return None;
+    }
+    let mut s = char_idx;
+    while s > 0 && is_word_char(chars[s - 1]) {
+        s -= 1;
+    }
+    let mut e = char_idx;
+    while e < chars.len() && is_word_char(chars[e]) {
+        e += 1;
+    }
+    let w: String = chars[s..e].iter().collect();
+    (!w.is_empty()).then_some(w)
+}
+
+/// 词字符：排除空白与常见分隔符，其余（含 `.` `:` `-` `_`）都算词内字符，
+/// 这样 `com.example.Foo`、`12:00:03.123` 这类日志 token 会被整体取到。
+fn is_word_char(c: char) -> bool {
+    !(c.is_whitespace()
+        || matches!(
+            c,
+            ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '<' | '>' | '|'
+        ))
+}
+
 /// 估算最长行的渲染宽度（像素），用于固定横向滚动范围。
 ///
 /// 只采样前 [`SAMPLE_LINES`] 行：对上亿行的文件全量扫描不可接受，而日志的行宽分布
 /// 通常稳定。取最大值而非平均值——横向滚动必须能覆盖最长的那一行。
 ///
 /// CJK 字形约为等宽拉丁字符的两倍宽，因此按「ASCII 记 1、非 ASCII 记 1.7」加权。
-pub fn estimate_content_width(fileset: &crate::core::indexer::FileSet) -> f32 {
+pub fn estimate_content_width(fileset: &crate::core::indexer::FileSet, font_size: f32) -> f32 {
     let lines = fileset.total_lines().min(SAMPLE_LINES);
     let mut max = 0.0_f32;
     for i in 0..lines {
         if let Some(line) = fileset.line(i) {
-            let w = estimate_text_width(&line);
+            let w = estimate_text_width(&line, font_size);
             if w > max {
                 max = w;
             }
@@ -586,14 +670,18 @@ pub fn estimate_content_width(fileset: &crate::core::indexer::FileSet) -> f32 {
 }
 
 /// 按字符类别加权的宽度估算（单位：像素）。
-fn estimate_text_width(line: &str) -> f32 {
+///
+/// 基准常量是 `theme::LOG_FONT_SIZE`（12.5px）下的实测字宽，故按当前字号等比缩放——
+/// 否则 `⌘+` 放大后估算值偏小，横向滚动条会滚不到行尾。
+fn estimate_text_width(line: &str, font_size: f32) -> f32 {
     const ASCII_W: f32 = 7.2; // 12.5px 等宽拉丁字符的实测字宽
     const WIDE_W: f32 = 12.2; // CJK 等全角字符约为一个 em
+    let scale = font_size / theme::LOG_FONT_SIZE;
     let mut w = 0.0_f32;
     for c in line.chars() {
         w += if c.is_ascii() { ASCII_W } else { WIDE_W };
     }
-    w
+    w * scale
 }
 
 #[cfg(test)]
@@ -673,9 +761,44 @@ mod tests {
     #[test]
     fn wide_chars_count_more_than_ascii() {
         // CJK 字形约为拉丁字符的两倍宽，估算必须体现这一点，否则中文日志会被横向截断
-        let ascii = estimate_text_width("aaaa");
-        let cjk = estimate_text_width("中中中中");
+        let ascii = estimate_text_width("aaaa", theme::LOG_FONT_SIZE);
+        let cjk = estimate_text_width("中中中中", theme::LOG_FONT_SIZE);
         assert!(cjk > ascii * 1.5, "ascii={ascii}, cjk={cjk}");
+    }
+
+    // —— 双击取词（word_at / is_word_char） ——
+
+    #[test]
+    fn word_at_extracts_log_token_with_punctuation() {
+        // 日志 token 里 `.` `:` `-` 都算词内字符，双击 `com.example.Foo` 应整体取到
+        let line = "error at com.example.Foo:42 failed";
+        let start = line.find("com.example").unwrap();
+        assert_eq!(word_at(line, start).as_deref(), Some("com.example.Foo:42"));
+    }
+
+    #[test]
+    fn word_at_rejects_delimiters_and_out_of_range() {
+        let line = "a, b";
+        // 逗号是分隔符（不在词内），落在它上面返回 None
+        assert_eq!(word_at(line, 1), None);
+        // 越界返回 None
+        assert_eq!(word_at(line, 99), None);
+        // 空白也返回 None
+        let s = "foo bar";
+        assert_eq!(word_at(s, 3), None);
+    }
+
+    #[test]
+    fn word_at_handles_cjk_and_leading_boundary() {
+        // 词首/词尾的边界字符都能正确取词（空格是分隔符，`=` 按日志 token 语义算词内字符）
+        let line = "错误码 42";
+        assert_eq!(word_at(line, 0).as_deref(), Some("错误码"));
+        assert_eq!(
+            word_at(line, line.chars().count() - 1).as_deref(),
+            Some("42")
+        );
+        // `=` 不算分隔符：key=value 是完整日志 token，双击应整体取到
+        assert_eq!(word_at("code=42", 0).as_deref(), Some("code=42"));
     }
 
     #[test]
