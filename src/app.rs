@@ -1666,6 +1666,98 @@ fn render_one_in_rect(
     render_one_pane(&mut child, state, pane_id)
 }
 
+/// 标题条图标按钮：扁平无边框（VS Code action icon 观感），默认仅显示图标本体，
+/// hover 时才铺一层浅色圆角背景，按下态用更深一档的 `control_hover`。
+///
+/// `paint` 闭包负责绘制图标本体，收到居中区域 `rect` 与最终前景色 `color`（已按
+/// 启用/hover/按下态算好），这样字符图标与自绘矢量图标共用同一套状态与命中区域。
+fn titlebar_icon(
+    ui: &mut egui::Ui,
+    tip: &str,
+    enabled: bool,
+    paint: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    let p = theme::palette(ui.ctx());
+    // 18×18 命中区：与编辑器标题条图标尺寸一致，且不至于误触相邻图标。
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+    if enabled {
+        if resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(rect, 3.0, p.control_hover);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(rect, 3.0, p.row_hover);
+        }
+    }
+    let color = if !enabled {
+        p.text_dim.gamma_multiply(0.45)
+    } else if resp.hovered() || resp.is_pointer_button_down_on() {
+        p.text_strong
+    } else {
+        p.text_dim
+    };
+    paint(ui.painter(), rect, color);
+    resp = resp.on_hover_text(tip);
+    resp
+}
+
+/// 标题条「拆分」图标：VS Code 的 split 图标是「一个矩形被一条竖线左右平分」，
+/// 这里用 `Painter` 自绘（外框 + 中线），避免依赖字体对几何符号的支持。
+fn titlebar_split_icon(ui: &mut egui::Ui, tip: &str, enabled: bool) -> egui::Response {
+    titlebar_icon(ui, tip, enabled, |painter, rect, color| {
+        let r = rect.shrink(4.0);
+        let stroke = egui::Stroke::new(1.2, color);
+        painter.rect_stroke(r, 1.0, stroke, egui::StrokeKind::Inside);
+        let cx = r.center().x;
+        painter.line_segment(
+            [egui::pos2(cx, r.top()), egui::pos2(cx, r.bottom())],
+            stroke,
+        );
+    })
+}
+
+/// 标题条字符图标：单字符居中绘制（关闭 `×`、单独打开 `＋`）。
+fn titlebar_char_icon(ui: &mut egui::Ui, ch: &str, tip: &str, enabled: bool) -> egui::Response {
+    titlebar_icon(ui, tip, enabled, |painter, rect, color| {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            ch,
+            egui::FontId::proportional(13.0),
+            color,
+        );
+    })
+}
+
+/// 标题条「返回共享」图标：自绘左箭头。不用 U+21A9（`↩`，Arrows 区）——
+/// egui 内置字体链（Ubuntu-Light/NotoEmoji/MiSans）对该字符字形覆盖不可靠，
+/// 可能渲染成豆腐块；自绘矢量则与拆分图标风格统一且确定性渲染。
+fn titlebar_back_icon(ui: &mut egui::Ui, tip: &str, enabled: bool) -> egui::Response {
+    titlebar_icon(ui, tip, enabled, |painter, rect, color| {
+        let r = rect.shrink(4.0);
+        let stroke = egui::Stroke::new(1.2, color);
+        let mid_y = r.center().y;
+        // 主干：从右端指向左端的水平线。
+        painter.line_segment(
+            [egui::pos2(r.right(), mid_y), egui::pos2(r.left(), mid_y)],
+            stroke,
+        );
+        // 箭头：左上 + 左下两条斜线。
+        painter.line_segment(
+            [
+                egui::pos2(r.left(), mid_y),
+                egui::pos2(r.left() + 3.0, mid_y - 3.0),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(r.left(), mid_y),
+                egui::pos2(r.left() + 3.0, mid_y + 3.0),
+            ],
+            stroke,
+        );
+    })
+}
+
 /// 渲染单个日志面板：标题条（文件名 + 关闭按钮 + 激活态高亮） + 正文。
 ///
 /// 返回 `Some(pane_id)` 表示用户点了标题条的关闭按钮，由上层关闭面板。
@@ -1697,41 +1789,63 @@ fn render_one_pane(ui: &mut egui::Ui, state: &mut AppState, pane_id: usize) -> O
                 state.active_pane = pane_id;
                 state.sync_active_pane_mirror();
             }
+            // 标题条右侧图标区（right_to_left：最右为关闭，往左依次拆分、单独打开/返回共享）。
+            // 全部图标化、扁平无边框，对齐 VS Code 编辑器组的 action icon 观感。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 该面板已单独打开文件 → 提供「返回共享」；否则提供「本面板打开」单独载入一个文件。
-                if state.panes[pane_id].fileset_override.is_some() {
-                    if ui
-                        .small_button("共享")
-                        .on_hover_text("改回共享全局文件集")
-                        .clicked()
-                    {
-                        state.panes[pane_id].fileset_override = None;
-                        state.panes[pane_id].selected_row = None;
-                        state.panes[pane_id].scroll_target = None;
-                        state.panes[pane_id].max_line_width = 0.0; // 惰性重算
-                    }
-                } else if ui
-                    .small_button("本面板")
-                    .on_hover_text("在本面板单独打开一个日志文件（与全局文件集脱钩）")
-                    .clicked()
-                {
-                    state.pending_open_in_pane = Some(pane_id);
-                }
                 // 关闭按钮始终显示：多面板=关闭该面板，单面板=关闭当前文件（回到空面板）。
-                if ui
-                    .small_button("✕")
-                    .on_hover_text(if state.pane_layout.count > 1 {
+                if titlebar_char_icon(
+                    ui,
+                    "×",
+                    if state.pane_layout.count > 1 {
                         "关闭面板"
                     } else {
                         "关闭文件"
-                    })
-                    .clicked()
+                    },
+                    true,
+                )
+                .clicked()
                 {
                     if state.pane_layout.count > 1 {
                         closed = true;
                     } else {
                         close_file = true;
                     }
+                }
+
+                // 拆分：向右拆分出一个新面板（VS Code 默认 split 方向），达到上限则禁用。
+                let can_split = state.pane_layout.count < MAX_PANES;
+                if titlebar_split_icon(
+                    ui,
+                    if can_split {
+                        "向右拆分出新面板"
+                    } else {
+                        "已达到面板数量上限"
+                    },
+                    can_split,
+                )
+                .clicked()
+                {
+                    state.split_pane(SplitDir::Horizontal);
+                    state.save_prefs();
+                }
+
+                // 该面板已单独打开文件 → 提供「返回共享」；否则提供「本面板打开」单独载入文件。
+                if state.panes[pane_id].fileset_override.is_some() {
+                    if titlebar_back_icon(ui, "改回共享全局文件集", true).clicked() {
+                        state.panes[pane_id].fileset_override = None;
+                        state.panes[pane_id].selected_row = None;
+                        state.panes[pane_id].scroll_target = None;
+                        state.panes[pane_id].max_line_width = 0.0; // 惰性重算
+                    }
+                } else if titlebar_char_icon(
+                    ui,
+                    "＋",
+                    "在本面板单独打开一个日志文件（与全局文件集脱钩）",
+                    true,
+                )
+                .clicked()
+                {
+                    state.pending_open_in_pane = Some(pane_id);
                 }
             });
         });
