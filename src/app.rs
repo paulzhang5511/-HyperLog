@@ -43,20 +43,31 @@ impl SplitDir {
     }
 }
 
-/// 面板布局：`count` 个面板按 `dir` 均分；`count == 4` 时渲染为 2×2 网格。
+/// 面板布局：`count` 个面板按 `dir` 分割；`count == 4` 时渲染为 2×2 网格。
+///
+/// 分割位置由 [`PaneLayout::ratio`] 决定（第一块占总尺寸的比例，可拖拽分隔条调整），
+/// 不再固定对半均分。
 #[derive(Clone, Debug)]
 pub struct PaneLayout {
     /// 拆分方向（`count == 4` 时用作外层方向）。
     pub dir: SplitDir,
     /// 面板数量，恒在 `1..=MAX_PANES`。
     pub count: usize,
+    /// 第一块占总尺寸的比例（`0.0..=1.0`，实际 clamp 到 [`MIN_RATIO`]..=[`MAX_RATIO`]）。
+    /// 所有分割点共用同一个比例（2×2 网格内外层一致，作为 MVP 简化）。
+    pub ratio: f32,
 }
+
+/// 分割比例的下限 / 上限（避免某一面板被拖到不可见）。
+const MIN_RATIO: f32 = 0.15;
+const MAX_RATIO: f32 = 0.85;
 
 impl Default for PaneLayout {
     fn default() -> Self {
         Self {
             dir: SplitDir::Horizontal,
             count: 1,
+            ratio: 0.5,
         }
     }
 }
@@ -262,9 +273,10 @@ impl AppState {
         let mut p = self.prefs.clone();
         p.wrap = self.wrap;
         p.sidebar_visible = self.show_sidebar;
-        // 拆分布局：数量与方向一并持久化（`split_vertical` 用 bool 表达，避免 core 依赖 egui）。
+        // 拆分布局：数量、方向、分割比例一并持久化（`split_vertical` 用 bool 表达，避免 core 依赖 egui）。
         p.split_count = self.pane_layout.count;
         p.split_vertical = self.pane_layout.dir == SplitDir::Vertical;
+        p.split_ratio = self.pane_layout.ratio;
         p.save();
     }
 
@@ -535,6 +547,7 @@ impl LogViewerApp {
                 SplitDir::Horizontal
             },
             count: app.state.prefs.split_count.clamp(1, MAX_PANES),
+            ratio: app.state.prefs.split_ratio,
         };
         app.state.ensure_panes();
         // 折行是每面板独立的状态，初值取自偏好后同步进活动面板。
@@ -1446,15 +1459,23 @@ fn render_log_area(ui: &mut egui::Ui, state: &mut AppState) {
     state.ensure_panes();
     let n = state.pane_layout.count.clamp(1, MAX_PANES);
     let dir = state.pane_layout.dir;
+    let ratio = state.pane_layout.ratio;
     let closed = match n {
         1 => render_one_in_rect(ui, ui.available_rect_before_wrap(), state, 0),
         2 => split_panes(ui, state, &[0, 1], dir),
         3 => {
             let rect = ui.available_rect_before_wrap();
-            let (r0, r1) = halve(rect, dir);
+            let (r0, r1) = split_at_ratio(rect, dir, ratio);
             if let Some(id) = render_one_in_rect(ui, r0, state, 0) {
                 Some(id)
             } else {
+                let (new_ratio, stopped) = split_drag_handle(ui, r0, r1, dir);
+                if let Some(r) = new_ratio {
+                    state.pane_layout.ratio = r;
+                }
+                if stopped {
+                    state.save_prefs();
+                }
                 let mut child = ui.new_child(egui::UiBuilder {
                     max_rect: Some(r1),
                     layout: Some(*ui.layout()),
@@ -1465,7 +1486,7 @@ fn render_log_area(ui: &mut egui::Ui, state: &mut AppState) {
         }
         4 => {
             let rect = ui.available_rect_before_wrap();
-            let (r0, r1) = halve(rect, dir);
+            let (r0, r1) = split_at_ratio(rect, dir, ratio);
             let mut c0 = ui.new_child(egui::UiBuilder {
                 max_rect: Some(r0),
                 layout: Some(*ui.layout()),
@@ -1474,6 +1495,13 @@ fn render_log_area(ui: &mut egui::Ui, state: &mut AppState) {
             if let Some(id) = split_panes(&mut c0, state, &[0, 1], dir.perpendicular()) {
                 Some(id)
             } else {
+                let (new_ratio, stopped) = split_drag_handle(ui, r0, r1, dir);
+                if let Some(r) = new_ratio {
+                    state.pane_layout.ratio = r;
+                }
+                if stopped {
+                    state.save_prefs();
+                }
                 let mut c1 = ui.new_child(egui::UiBuilder {
                     max_rect: Some(r1),
                     layout: Some(*ui.layout()),
@@ -1503,9 +1531,18 @@ fn split_panes(
         1 => render_one_pane(ui, state, ids[0]),
         2 => {
             let rect = ui.available_rect_before_wrap();
-            let (r0, r1) = halve(rect, dir);
+            let ratio = state.pane_layout.ratio;
+            let (r0, r1) = split_at_ratio(rect, dir, ratio);
             if let Some(id) = render_one_in_rect(ui, r0, state, ids[0]) {
                 return Some(id);
+            }
+            // 分隔条：可拖拽，拖动时按指针位置改写分割比例（作用于所有分割点）。
+            let (new_ratio, stopped) = split_drag_handle(ui, r0, r1, dir);
+            if let Some(r) = new_ratio {
+                state.pane_layout.ratio = r;
+            }
+            if stopped {
+                state.save_prefs();
             }
             render_one_in_rect(ui, r1, state, ids[1])
         }
@@ -1520,11 +1557,80 @@ fn split_panes(
     }
 }
 
-/// 按方向把矩形对半切（返回左/右或上/下两部分）。
-fn halve(rect: egui::Rect, dir: SplitDir) -> (egui::Rect, egui::Rect) {
+/// 在左右/上下两块之间绘制一个可拖拽的分隔条。
+///
+/// 返回 `(new_ratio, stopped)`：`new_ratio` 为本次帧拖动后的新比例（`Some` 表示拖动中），
+/// `stopped` 表示本次帧结束拖动（调用方据此持久化）。分隔条宽度 `SEP_W`，两侧各留响应热区，
+/// 拖动时指针位置映射回比例并 clamp。
+fn split_drag_handle(
+    ui: &mut egui::Ui,
+    r0: egui::Rect,
+    r1: egui::Rect,
+    dir: SplitDir,
+) -> (Option<f32>, bool) {
+    const SEP_W: f32 = 5.0;
+    let p = theme::palette(ui.ctx());
+    let sep_rect = match dir {
+        SplitDir::Horizontal => egui::Rect::from_min_max(
+            egui::pos2(r0.right(), r0.top()),
+            egui::pos2(r1.left(), r0.bottom()),
+        ),
+        SplitDir::Vertical => egui::Rect::from_min_max(
+            egui::pos2(r0.left(), r0.bottom()),
+            egui::pos2(r0.right(), r1.top()),
+        ),
+    };
+    // 热区比可视条略宽，便于抓取。
+    let hot = sep_rect.expand2(if dir == SplitDir::Horizontal {
+        egui::vec2(SEP_W, 0.0)
+    } else {
+        egui::vec2(0.0, SEP_W)
+    });
+    let resp = ui.interact(hot, ui.id().with("split_drag"), egui::Sense::drag());
+
+    let total = match dir {
+        SplitDir::Horizontal => r0.width() + r1.width(),
+        SplitDir::Vertical => r0.height() + r1.height(),
+    };
+    // 拖动中 / 结束拖动：指针位置相对总矩形映射回比例。
+    let mut new_ratio = None;
+    if (resp.dragged() || resp.drag_stopped())
+        && total > 0.0
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        let frac = match dir {
+            SplitDir::Horizontal => (pos.x - r0.left()) / total,
+            SplitDir::Vertical => (pos.y - r0.top()) / total,
+        };
+        new_ratio = Some(frac.clamp(MIN_RATIO, MAX_RATIO));
+    }
+
+    // 视觉：悬停/拖动时高亮分隔条，否则画细线。
+    let color = if resp.hovered() || resp.dragged() {
+        p.accent
+    } else {
+        p.border
+    };
+    ui.painter().rect_filled(sep_rect, 0.0, color);
+    // 拖动时更新光标，提示可拖。
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(if dir == SplitDir::Horizontal {
+            egui::CursorIcon::ResizeHorizontal
+        } else {
+            egui::CursorIcon::ResizeVertical
+        });
+    }
+    (new_ratio, resp.drag_stopped())
+}
+
+/// 按方向和比例把矩形切成两块（返回左/右或上/下两部分）。
+///
+/// `ratio` 为第一块占总尺寸的比例，clamp 到 [`MIN_RATIO`]..=[`MAX_RATIO`]。
+fn split_at_ratio(rect: egui::Rect, dir: SplitDir, ratio: f32) -> (egui::Rect, egui::Rect) {
+    let ratio = ratio.clamp(MIN_RATIO, MAX_RATIO);
     match dir {
-        SplitDir::Horizontal => rect.split_left_right_at_x(rect.left() + rect.width() / 2.0),
-        SplitDir::Vertical => rect.split_top_bottom_at_y(rect.top() + rect.height() / 2.0),
+        SplitDir::Horizontal => rect.split_left_right_at_x(rect.left() + rect.width() * ratio),
+        SplitDir::Vertical => rect.split_top_bottom_at_y(rect.top() + rect.height() * ratio),
     }
 }
 
@@ -1902,12 +2008,12 @@ mod tests {
         }
     }
 
-    // —— 矩形二等分（布局几何） ——
+    // —— 矩形分割（布局几何） ——
 
     #[test]
-    fn halve_horizontal_splits_left_right_at_midpoint() {
+    fn split_at_ratio_horizontal_splits_left_right() {
         let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 50.0));
-        let (l, r) = halve(rect, SplitDir::Horizontal);
+        let (l, r) = split_at_ratio(rect, SplitDir::Horizontal, 0.5);
         assert_eq!(l.width(), 50.0);
         assert_eq!(r.width(), 50.0);
         assert_eq!(l.height(), 50.0);
@@ -1916,14 +2022,33 @@ mod tests {
     }
 
     #[test]
-    fn halve_vertical_splits_top_bottom_at_midpoint() {
+    fn split_at_ratio_vertical_splits_top_bottom() {
         let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 50.0));
-        let (t, b) = halve(rect, SplitDir::Vertical);
+        let (t, b) = split_at_ratio(rect, SplitDir::Vertical, 0.5);
         assert_eq!(t.height(), 25.0);
         assert_eq!(b.height(), 25.0);
         assert_eq!(t.width(), 100.0);
         assert_eq!(b.width(), 100.0);
         assert_eq!(t.bottom(), b.top()); // 无缝拼接
+    }
+
+    #[test]
+    fn split_at_ratio_uses_given_fraction() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 50.0));
+        let (l, r) = split_at_ratio(rect, SplitDir::Horizontal, 0.3);
+        assert!((l.width() - 30.0).abs() < 0.01);
+        assert!((r.width() - 70.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn split_at_ratio_clamps_to_sane_range() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 50.0));
+        // 0.0 → clamp 到 MIN_RATIO(0.15)
+        let (l, _) = split_at_ratio(rect, SplitDir::Horizontal, 0.0);
+        assert!((l.width() - 15.0).abs() < 0.01);
+        // 1.0 → clamp 到 MAX_RATIO(0.85)
+        let (l2, _) = split_at_ratio(rect, SplitDir::Horizontal, 1.0);
+        assert!((l2.width() - 85.0).abs() < 0.01);
     }
 
     // —— 打开路径的分流（open_paths） ——

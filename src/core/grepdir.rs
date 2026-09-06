@@ -183,7 +183,17 @@ fn search_one_file(
         }
         let (bl, bh) = idx.byte_range(lo, hi);
         let slice = &idx.raw_bytes()[bl..bh];
+        // 块内命中密集时（如大量 ERROR），逐个 `line()` 提取文本开销可观，单块处理
+        // 可能超过 500ms。每处理 1024 个命中检查一次取消，保证取消响应 < 500ms（P10）。
+        let mut hits_in_chunk = 0usize;
         for m in re.find_iter(slice) {
+            if hits_in_chunk >= 1024 {
+                hits_in_chunk = 0;
+                if cancel.is_cancelled() {
+                    break 'outer;
+                }
+            }
+            hits_in_chunk += 1;
             let (s, e) = (m.start(), m.end());
             if slice[s..e].contains(&b'\n') {
                 continue;

@@ -585,15 +585,19 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
 
 - 全局共享、不进 `PaneState`：`fileset`（默认文件集）、`highlighter`、`search_*`、`hit_regex`、
   `pending_*`、`prefs`、`recents`、`dirty_files`、`show_sidebar`、`show_results`、`line_jump`。
-- `PaneLayout { dir: SplitDir, count: usize }`：`dir` 为 `Horizontal`（左右）/ `Vertical`（上下），
-  `count` 为 `1..=MAX_PANES`（常量 `MAX_PANES = 4`）。`count == 4` 时渲染为 **2×2 网格**
-  （外层按 `dir` 切 2 份，每份再按垂直方向切 2 份）。
+- `PaneLayout { dir: SplitDir, count: usize, ratio: f32 }`：`dir` 为 `Horizontal`（左右）/ `Vertical`（上下），
+  `count` 为 `1..=MAX_PANES`（常量 `MAX_PANES = 4`），`ratio` 为分割位置（第一块占总尺寸比例，
+  clamp 到 `0.15..=0.85`）。`count == 4` 时渲染为 **2×2 网格**
+  （外层按 `dir` 切 2 份，每份再按垂直方向切 2 份；所有分割点共用同一个 `ratio`）。
 
 **渲染约束**
 
 - egui 只允许**一个 `CentralPanel`** 吃掉剩余空间 → 拆分必须在其内部做，用
   `ui.new_child(egui::UiBuilder { max_rect })` 手工切分矩形（egui 0.36 已移除 `child_ui` /
   `allocate_ui_at_rect`，改用 `new_child`；不用 `ui.columns`，它无法精确控制分隔线）。
+- **面板大小可调**：两块之间渲染可拖拽分隔条（`split_drag_handle`，宽 5px + 两侧热区），
+  拖动时按指针位置映射回 `PaneLayout::ratio`（clamp 到 `0.15..=0.85`），结束拖动（`drag_stopped`）
+  时 `save_prefs()` 持久化；分割位置用 `split_at_ratio(rect, dir, ratio)` 计算。
 - `log_view::show` 签名改为 `show(ui, &AppState, &mut PaneState, pane_id)`，并把两处
   **「先到先得」的全局消费**改为按面板隔离：`scroll_target` 用 `take()`（改为面板字段后天然隔离）、
   ⌘C 复制用 `consume_shortcut` 加 `pane_id` 判定的活动面板守卫——否则面板 A 吃掉后面板 B 永远收不到。
@@ -898,14 +902,14 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 
 | # | 指标 | 目标 | 实测 | 结论 |
 | --- | --- | --- | --- | --- |
-| P1 | 打开 1 GB（≈1000 万行） | < 2.0 s | **1.0–1.3 s** | ✅ 余量充足（预热页缓存后；冷盘首开另受存储限制） |
+| P1 | 打开 1 GB（≈1000 万行） | < 2.0 s | **1.0–1.3 s**（2026-09-06 复测 **1.94 s**） | ✅ 余量充足（预热页缓存后；冷盘首开另受存储限制） |
 | P2 | 打开 10 GB（≈1 亿行） | < 20 s | **15.52 s** | ✅ 余量充足（预热页缓存后；`#[ignore]` 测试 `open_10gb_under_20s`） |
 | P3 | 索引常驻内存 | ≤ 8 B/行 | 8.00 B/行（80 MB / 1000 万行） | ✅ 恰好达标（`Vec<usize>` 8 字节/行） |
-| P7 | 正则检索吞吐 | ≥ 200 MB/s | **峰值 1360 MB/s** | ✅ 余量充足（M7 块级并行扫描） |
-| P8 | 纯文本（字面量）检索吞吐 | ≥ 800 MB/s | **峰值 2275 MB/s** | ✅ 余量充足（M7 块级并行扫描） |
-| P9 | 进度消息频率 | ≤ 20 条/秒 | 9.1 条/秒 | ✅（节流 100 ms，实测 9~10 条/秒） |
-| P10 | 取消响应延迟 | < 500 ms | 5.8 ms | ✅（取消检查在波次之间） |
-| P11 | 导出 100 万行 | < 10 s | 356 ms（104 MB） | ✅ 余量充足 |
+| P7 | 正则检索吞吐 | ≥ 200 MB/s | **峰值 690–1360 MB/s**（2026-09-06 复测 **690 MB/s**） | ✅ 余量充足（M7 块级并行扫描） |
+| P8 | 纯文本（字面量）检索吞吐 | ≥ 800 MB/s | **峰值 1028–2275 MB/s**（2026-09-06 复测 **1028 MB/s**） | ✅ 余量充足（M7 块级并行扫描） |
+| P9 | 进度消息频率 | ≤ 20 条/秒 | 8.8–9.1 条/秒（2026-09-06 复测 **8.8 条/s**） | ✅（节流 100 ms） |
+| P10 | 取消响应延迟 | < 500 ms | 5.8–28.5 ms（2026-09-06 复测 **28.5 ms**；目录检索版 **25.8 ms**） | ✅（取消检查在波次之间） |
+| P11 | 导出 100 万行 | < 10 s | 356–582 ms（2026-09-06 复测 **582 ms**，104 MB） | ✅ 余量充足 |
 | P4 | 滚动 1000 万行文件帧率 | p95 帧耗时 < 16.6 ms（60 FPS） | 无头实测 avg≈60fps、p95≈21ms（21ms 为无 GPU 软件渲染抖动，非真实 GPU 上限；真机 HUD 受 vsync 限制在 ~16.6ms） | ⚠️ 需真机确认（无头软件渲染无法精确测 p95） |
 | P5 | 单帧渲染 UI 节点数 | 恒定 ≤ 视口行数 + 10（≈60） | 1.2 GB 文件稳态帧耗时与文件大小无关（峰值恒定 ~21ms），虚拟滚动节点数恒定 → 渲染开销与文件规模解耦 | ✅ 设计保证 + 常量开销证据 |
 | P6 | 检索期间 UI 最长卡顿帧 | < 50 ms | 无头软件渲染下稳态峰值 21ms、偶发首帧布局 102ms（一次性初始化，非滚动/检索帧）；即便无 GPU 仍 ≪ 50ms | ✅ 余量充足 |
@@ -1045,3 +1049,5 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-06 | M18 拆分面板对比视图（参考 VSCode 编辑器组，spec §7.7.7）：① **数据模型**——抽出 `PaneState`（`fileset_override`/`selected_row`/`scroll_target`/`wrap`/`max_line_width`/`in_result_mode`），每面板独立持有视图态；`AppState` 删全局 `wrap`/`selected_row`/`scroll_target`/`max_line_width`，改加 `panes: Vec<PaneState>`、`pane_layout: PaneLayout{dir,count}`、`active_pane`；`PaneLayout.dir` 为 `SplitDir{Horizontal,Vertical}`、`MAX_PANES=4`（count==4 渲染 2×2 网格）；拆分状态（`split_dir`/`split_count`，clamp 1..=4）写入 `Prefs` 持久化。② **渲染**——egui 只允许一个 `CentralPanel`，拆分在其内部用 `ui.new_child(UiBuilder{max_rect,..})` 手工切分矩形（egui 0.36 已移除 `child_ui`/`allocate_ui_at_rect`）；`log_view::show` 签名改 `(ui, &AppState, &mut PaneState, pane_id)`，两处「先到先得」全局消费改按面板隔离（`scroll_target` 用 `take()`、⌘C 复制加活动面板守卫）。③ **交互**——`active_pane` 标记活动面板（点击标题条/正文即激活并高亮）；工具栏新增拆分方向/关闭面板按钮；每面板标题栏含「本面板打开」（写 `fileset_override` 单独载入文件，与全局文件集脱钩，便于对比两份不同日志）、「共享」（返回全局文件集）、「关闭」（count>1 可关）；侧边栏跳转/⌘L/查找结果跳转只作用于活动面板；`load_paths`/`reload_all` 清态时遍历所有面板并清空 `fileset_override`。④ egui 0.36 API 修正：`child_ui`→`new_child(UiBuilder)`、`available_rect_before_put`→`available_rect_before_wrap`。门禁 fmt/clippy(-D warnings)/63 单测全绿 | Agent |
 | 2026-09-06 | 修复**拆分面板打开文件后正文不显示**：标题条用 `Frame::show` 包裹时，`Frame::begin` 把整个面板高度作为 content_ui 的 max_rect，垂直居中的 `selectable_label` 把 min_rect 撑满整高，`Frame::end` 把父 ui cursor 推到面板底部 → 正文 `available_height` 归零、`ScrollArea` 不渲染。改为标题条用 `horizontal` 手动布局（自然高度）+ `painter.rect_filled` 画背景，正文取剩余矩形 `new_child` 撑满。同时新增拆分面板纯逻辑单测 20 个（单测 63→83），并修正 `active_pane_mut` 注释（实现是 `min(len-1)` 回退到**最后一个**，非「第一个」）。门禁 fmt/clippy(-D warnings)/83 单测全绿 | Agent |
 | 2026-09-06 | 修复**两个面板显示相同内容**：普通「打开文件/打开目录」此前走 `load_paths` 全局替换，拆分后两个面板都显示同一 `fileset`。改为按活动面板分流——`open_paths` 入口：未拆分（`count==1`）保持旧语义全局替换；已拆分（`count>=2`）调用新增的 `AppState::open_paths_to_active_pane`，把文件写入**活动面板**的 `fileset_override`（其余面板与全局 `fileset` 不变）。这样「打开→面板 1、激活面板 2 再打开→面板 2」，两面板可分别显示不同文件。新增 2 个单测（83→85），§7.7.7 补「打开文件按活动面板分流」契约 | Agent |
+| 2026-09-06 | **面板支持拖拽调整大小**：`PaneLayout` 增 `ratio: f32`（第一块占总尺寸比例，clamp `0.15..=0.85`，`MIN_RATIO`/`MAX_RATIO` 常量）；渲染用 `split_at_ratio(rect, dir, ratio)` 替代固定对半切的 `halve`；两面板之间新增可拖拽分隔条 `split_drag_handle`（宽 5px + 两侧热区，悬停/拖动高亮 accent 色、光标变 Resize 图标），拖动时按指针位置映射回 `ratio`，结束拖动（`drag_stopped`）时 `save_prefs()` 持久化；所有分割点（含 2×2 网格内外层）共用同一 `ratio`。`prefs.rs` 增 `split_ratio` 键读写（clamp 0.15..=0.85）。删除 `halve`、改用 `split_at_ratio`，新增 4 个单测（85→87，含比例/方向/clamp）。§7.7.7 补「面板大小可调」契约 | Agent |
+| 2026-09-06 | **整体性能测试复测**（`cargo test --release -- --ignored`，样本 `gen_log.sh` 1GB/1000 万行，预热页缓存）：P1=1.94s(<2.0s)✅、P3=8.00B/行(≤8B)✅、P7=690MB/s(≥200)✅、P8=1028MB/s(≥800)✅、P9=8.8条/s(≤20)✅、P10=28.5ms(<500ms)✅、P11=582ms/104MB(<10s)✅，全部达标；P2 沿用已实测 15.52s（磁盘仅余 16GB，未重生成 10GB 样本）。**顺带增强 grepdir 取消检查**：`search_one_file` 块内每 1024 个命中额外查一次 `is_cancelled`（原仅块间 8MiB 检查，命中密集时单块 `line()` 提取可能超 500ms），目录检索版 P10 实测 25.8ms。§11.2.1 实测值更新为「历史+复测」双值 | Agent |

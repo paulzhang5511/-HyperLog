@@ -47,6 +47,9 @@ pub struct Prefs {
     /// 拆分方向：`true` = 上下，`false` = 左右。
     /// 用 `bool` 而非枚举，避免核心层引入 GUI 概念（与 [`ThemePref`] 同样的解耦思路）。
     pub split_vertical: bool,
+    /// 分割比例（第一块占总尺寸的比例，`0.0..=1.0`）。解析时 clamp 到 `[0.15, 0.85]`，
+    /// 避免某面板被拖到不可见后持久化。
+    pub split_ratio: f32,
 }
 
 impl Default for Prefs {
@@ -60,6 +63,7 @@ impl Default for Prefs {
             recent_searches: Vec::new(),
             split_count: 1,
             split_vertical: false,
+            split_ratio: 0.5,
         }
     }
 }
@@ -121,6 +125,11 @@ impl Prefs {
                         }
                     }
                     "split_dir" => prefs.split_vertical = v.trim().eq_ignore_ascii_case("vertical"),
+                    "split_ratio" => {
+                        if let Ok(r) = v.trim().parse::<f32>() {
+                            prefs.split_ratio = r.clamp(0.15, 0.85);
+                        }
+                    }
                     _ => {} // 未知键忽略
                 }
             }
@@ -179,6 +188,10 @@ impl Prefs {
             } else {
                 "horizontal"
             }
+        ));
+        text.push_str(&format!(
+            "split_ratio={:.4}\n",
+            self.split_ratio.clamp(0.15, 0.85)
         ));
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text)?;
