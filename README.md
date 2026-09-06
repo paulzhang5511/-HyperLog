@@ -18,8 +18,9 @@
 
 | 平台 | 产物 | 说明 |
 | --- | --- | --- |
-| macOS（Apple Silicon / Intel） | `HyperLog-macos.zip` | 解压后把 `HyperLog.app` 拖入「应用程序」 |
-| Windows（x64） | `hyper-log-windows.zip` | 解压后双击 `hyper-log.exe` |
+| macOS（Apple Silicon / M 系列） | `HyperLog-macos-arm.zip` | 解压后把 `HyperLog.app` 拖入「应用程序」 |
+| macOS（Intel） | `HyperLog-macos-intel.zip` | 解压后把 `HyperLog.app` 拖入「应用程序」 |
+| Windows（x64） | `hyper-log-windows-x64.zip` | 解压后双击 `hyper-log.exe` |
 
 > macOS 首次打开若提示「无法验证开发者」，请右键 →「打开」，或到「系统设置 → 隐私与安全性」点击「仍要打开」。
 

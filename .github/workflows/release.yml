@@ -1,6 +1,11 @@
 name: Release
 
 # 推送 v* 标签时构建 release 二进制并上传到 GitHub Release（附带打包产物）。
+# 发布目标（三平台）：
+#   - macOS Apple Silicon (arm64)   → macos-latest（arm64 runner）
+#   - macOS Intel (x86_64)          → macos-15-intel（GitHub 最后的 x86_64 macOS runner，
+#                                      macos-13 已于 2025-12-04 退役，此 runner 可用至 ~2027-08）
+#   - Windows x64                    → windows-latest
 on:
   push:
     tags:
@@ -17,43 +22,57 @@ permissions:
 
 jobs:
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            target: macos
-            asset_path: dist/HyperLog-macos.zip
-            asset_name: HyperLog-macos.zip
-          - os: windows-latest
-            target: windows
-            asset_path: dist/hyper-log-windows.zip
-            asset_name: hyper-log-windows.zip
+          # macOS Apple Silicon（arm64）
+          - name: macos-arm
+            os: macos-latest
+            target: aarch64-apple-darwin
+            asset_path: dist/HyperLog-macos-arm.zip
+          # macOS Intel（x86_64）
+          - name: macos-intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset_path: dist/HyperLog-macos-intel.zip
+          # Windows x64
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_path: dist/hyper-log-windows-x64.zip
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build (release)
-        run: cargo build --release
+      # macOS：用 package_macos.sh（内部按 target 交叉/原生编译并组装 .app）。
+      # 注意：runner 原生架构与 target 一致时脚本走原生编译；不一致时 rustup target add 交叉编译。
+      - name: Build & Package (macOS)
+        if: runner.os == 'macOS'
+        run: bash scripts/package_macos.sh "${{ matrix.target }}"
 
-      - name: Package (macOS)
-        if: matrix.target == 'macos'
-        run: bash scripts/package_macos.sh
+      # Windows：直接用指定 target 编译，再打包成 zip。
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (Windows)
-        if: matrix.target == 'windows'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/hyper-log.exe dist/
-          Compress-Archive -Path dist/hyper-log.exe -DestinationPath dist/hyper-log-windows.zip -Force
+          Copy-Item "target/${{ matrix.target }}/release/hyper-log.exe" dist/
+          Compress-Archive -Path dist/hyper-log.exe -DestinationPath dist/hyper-log-windows-x64.zip -Force
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
