@@ -33,7 +33,7 @@ impl ThemePref {
     }
 }
 
-/// 持久化偏好（窗口/主题/折行/侧栏/最近检索词）。
+/// 持久化偏好（窗口/主题/折行/侧栏/最近检索词/拆分面板）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prefs {
     pub theme: ThemePref,
@@ -42,6 +42,11 @@ pub struct Prefs {
     pub window_w: f32,
     pub window_h: f32,
     pub recent_searches: Vec<String>,
+    /// 拆分面板数量（1..=4）。超出范围时由 GUI 层 clamp，此处不做校验以便容错解析。
+    pub split_count: usize,
+    /// 拆分方向：`true` = 上下，`false` = 左右。
+    /// 用 `bool` 而非枚举，避免核心层引入 GUI 概念（与 [`ThemePref`] 同样的解耦思路）。
+    pub split_vertical: bool,
 }
 
 impl Default for Prefs {
@@ -53,6 +58,8 @@ impl Default for Prefs {
             window_w: 1280.0,
             window_h: 860.0,
             recent_searches: Vec::new(),
+            split_count: 1,
+            split_vertical: false,
         }
     }
 }
@@ -106,6 +113,14 @@ impl Prefs {
                             prefs.recent_searches.push(s);
                         }
                     }
+                    "split_count" => {
+                        if let Ok(n) = v.trim().parse::<usize>()
+                            && (1..=4).contains(&n)
+                        {
+                            prefs.split_count = n;
+                        }
+                    }
+                    "split_dir" => prefs.split_vertical = v.trim().eq_ignore_ascii_case("vertical"),
                     _ => {} // 未知键忽略
                 }
             }
@@ -156,6 +171,15 @@ impl Prefs {
             text.push_str(r);
             text.push('\n');
         }
+        text.push_str(&format!("split_count={}\n", self.split_count.max(1)));
+        text.push_str(&format!(
+            "split_dir={}\n",
+            if self.split_vertical {
+                "vertical"
+            } else {
+                "horizontal"
+            }
+        ));
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text)?;
         std::fs::rename(tmp, path)

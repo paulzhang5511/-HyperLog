@@ -1,4 +1,4 @@
-use crate::app::AppState;
+use crate::app::{AppState, MAX_PANES, SplitDir};
 use crate::core::search::SearchMode;
 
 /// 检索输入框的稳定 `Id`（⌘F 快捷键据此聚焦）。
@@ -133,7 +133,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     "{} 命中",
                     crate::util::group_digits(state.search_results.len())
                 ));
-                ui.toggle_value(&mut state.in_result_mode, "仅命中");
+                // 「仅命中」是每面板独立的视图模式：切换只作用于活动面板（spec §7.7.7）。
+                let mut in_res = state
+                    .active_pane()
+                    .map(|p| p.in_result_mode)
+                    .unwrap_or(false);
+                ui.toggle_value(&mut in_res, "仅命中");
+                state.active_pane_mut().in_result_mode = in_res;
+                state.in_result_mode = in_res; // 顶层镜像
 
                 if state.is_exporting {
                     if ui.button("取消导出").clicked() {
@@ -168,7 +175,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 apply_line_jump(state);
             }
 
-            // 折行开关：默认关，横向滚动（spec G7）
+            // 折行开关：默认关，横向滚动（spec G7）。每面板独立，切换写回活动面板。
             let wrap_label = if state.wrap {
                 "折行: 开"
             } else {
@@ -176,6 +183,35 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             };
             let w = ui.toggle_value(&mut state.wrap, wrap_label);
             if w.clicked() {
+                state.apply_wrap_to_active_pane();
+                state.save_prefs();
+            }
+
+            ui.separator();
+            // 拆分面板（VSCode 风格，最多 4 个，spec §7.7.7）
+            let can_split = state.pane_layout.count < MAX_PANES;
+            if ui
+                .add_enabled(can_split, egui::Button::new("右拆"))
+                .on_hover_text("向右拆分出一个新面板")
+                .clicked()
+            {
+                state.split_pane(SplitDir::Horizontal);
+                state.save_prefs();
+            }
+            if ui
+                .add_enabled(can_split, egui::Button::new("下拆"))
+                .on_hover_text("向下拆分出一个新面板")
+                .clicked()
+            {
+                state.split_pane(SplitDir::Vertical);
+                state.save_prefs();
+            }
+            if ui
+                .add_enabled(state.pane_layout.count > 1, egui::Button::new("关闭面板"))
+                .on_hover_text("关闭当前活动面板")
+                .clicked()
+            {
+                state.close_pane(state.active_pane);
                 state.save_prefs();
             }
 
@@ -230,7 +266,9 @@ fn apply_line_jump(state: &mut AppState) {
         && n <= total
     {
         let row = n - 1;
-        state.scroll_target = Some(row);
+        // 跳转只作用于活动面板（spec §7.7.7）。
+        state.jump_to_row(row);
+        state.active_pane_mut().selected_row = Some(row);
         state.selected_row = Some(row);
     }
 }

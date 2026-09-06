@@ -197,7 +197,9 @@ fn render_node(ui: &mut egui::Ui, state: &mut AppState, p: &Palette, node: &DirN
             })
             .inner;
         if clicked && let Some(start) = state.fileset.file_global_start(*file_idx) {
-            state.scroll_target = Some(start);
+            // 跳转只作用于活动面板（spec §7.7.7）。
+            state.jump_to_row(start);
+            state.active_pane_mut().selected_row = Some(start);
             state.selected_row = Some(start);
             state.sidebar_active_file = Some(*file_idx);
         }
@@ -218,7 +220,8 @@ fn file_context_menu(ui: &mut egui::Ui, state: &mut AppState, file_idx: usize, f
     }
     if ui.button("跳到该文件").clicked() {
         if let Some(start) = state.fileset.file_global_start(file_idx) {
-            state.scroll_target = Some(start);
+            state.jump_to_row(start);
+            state.active_pane_mut().selected_row = Some(start);
             state.selected_row = Some(start);
             state.sidebar_active_file = Some(file_idx);
         }

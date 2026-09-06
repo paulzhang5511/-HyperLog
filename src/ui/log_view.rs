@@ -8,7 +8,8 @@ use std::borrow::Cow;
 
 use eframe::egui::{self, Color32};
 
-use crate::app::AppState;
+use crate::app::{AppState, PaneState};
+use crate::core::indexer::FileSet;
 use crate::highlight::{Highlighter, Level, Segment};
 use crate::ui::theme::{self, Palette};
 
@@ -73,26 +74,36 @@ fn lock_scroll_axis(ui: &mut egui::Ui) {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+/// 渲染一个日志面板。
+///
+/// `pane` 是该面板独立持有的状态（选中行/跳转/折行/横向范围/视图模式），`state` 只提供
+/// 共享的只读数据（默认文件集、高亮器、检索结果）。这样两个面板可同时渲染而互不干扰——
+/// 若沿用原先单一的 `&mut AppState`，面板 A 会先消费掉 `scroll_target` 和 ⌘C 快捷键，
+/// 导致面板 B 永远收不到（spec §7.7.7）。
+///
+/// `pane_id` 用于区分各面板的 `ScrollArea` Id，并作为 ⌘C 复制的「活动面板」守卫。
+pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: usize) {
     // 触控板上下滑动常带轻微水平分量，先锁定主控方向再交给 ScrollArea，
     // 避免正文在上下滚动时左右漂移。
     lock_scroll_axis(ui);
     let p = theme::palette(ui.ctx());
-    let in_result = state.in_result_mode && !state.search_results.is_empty();
+    let in_result = pane.in_result_mode && !state.search_results.is_empty();
+    // 面板单独打开了文件就用它自己的文件集，否则共享全局文件集。
+    let fileset: &FileSet = pane.fileset_override.as_ref().unwrap_or(&state.fileset);
     let total = if in_result {
         state.search_results.len()
     } else {
-        state.fileset.total_lines()
+        fileset.total_lines()
     };
 
     if total == 0 {
         empty_hint(ui, p);
-        state.selected_row = None;
+        pane.selected_row = None;
         return;
     }
     // 全量 ↔ 命中视图切换后行号语义变化，越界的选中行直接丢弃。
-    if state.selected_row.is_some_and(|r| r >= total) {
-        state.selected_row = None;
+    if pane.selected_row.is_some_and(|r| r >= total) {
+        pane.selected_row = None;
     }
 
     // 结果视图下，若已编译命中正则则复用同一 `Regex` 做命中高亮（G5）。
@@ -117,8 +128,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let avail_text_w = (ui.available_width() - gutter_w - TEXT_PAD * 2.0).max(120.0);
 
     // 横向滚动范围按「估算的最长行」固定：若跟随当前可见行，滚动条长度会随滚动抖动。
-    let content_w = state.max_line_width.max(avail_text_w);
-    let (row_h, text_w) = if state.wrap {
+    // 首次（max_line_width==0）惰性估算，避免每帧扫描；`load_paths`/`reload` 清零各面板时也会重算。
+    if pane.max_line_width <= 0.0 {
+        pane.max_line_width = estimate_content_width(fileset);
+    }
+    let content_w = pane.max_line_width.max(avail_text_w);
+    let (row_h, text_w) = if pane.wrap {
         // 折行：行高统一按「最长行需折几行」放大（spec §7.7 的 MVP 方案）。
         // 逐行动态行高需要「行号 → y」的前缀和，与 1 亿行的 O(1) 定位（§7.2）冲突；
         // 同一日志文件的行长通常相近，统一行高的浪费有限。
@@ -129,13 +144,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     } else {
         (ROW_HEIGHT, content_w)
     };
-    ui.style_mut().wrap_mode = Some(if state.wrap {
+    ui.style_mut().wrap_mode = Some(if pane.wrap {
         egui::TextWrapMode::Wrap
     } else {
         egui::TextWrapMode::Extend
     });
 
-    let wrap_width = if state.wrap {
+    let wrap_width = if pane.wrap {
         avail_text_w
     } else {
         f32::INFINITY
@@ -144,15 +159,15 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let mut clicked: Option<usize> = None;
     let mut copied: Option<String> = None;
 
-    let out = egui::ScrollArea::both().auto_shrink([false; 2]).show_rows(
-        ui,
-        row_h,
-        total,
-        |ui, range| {
+    let out = egui::ScrollArea::both()
+        // 各面板必须用不同的 id，否则滚动位置会串（egui 按 Id 存 ScrollArea 状态）。
+        .id_salt(("log_pane", pane_id))
+        .auto_shrink([false; 2])
+        .show_rows(ui, row_h, total, |ui, range| {
             for row in range {
-                let (line, gutter_text) = row_content(state, row, in_result);
+                let (line, gutter_text) = row_content(state, fileset, row, in_result);
                 let text = truncate_for_render(&line);
-                let selected = state.selected_row == Some(row);
+                let selected = pane.selected_row == Some(row);
 
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -197,12 +212,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     });
                 });
             }
-        },
-    );
+        });
 
-    // 行号跳转：消费 scroll_target，直接设置滚动区纵向偏移（行高固定 → row*row_h）。
+    // 行号跳转：消费本面板自己的 scroll_target，直接设置滚动区纵向偏移（行高固定 → row*row_h）。
     // 行高固定是虚拟滚动 O(1) 定位的前提，故可用闭式偏移精确跳转（spec §7.2）。
-    if let Some(row) = state.scroll_target.take() {
+    if let Some(row) = pane.scroll_target.take() {
         let mut st = out.state;
         let content_h = total as f32 * row_h;
         let view_h = out.inner_rect.height().max(row_h);
@@ -212,36 +226,43 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     if let Some(r) = clicked {
-        state.selected_row = Some(r);
+        pane.selected_row = Some(r);
     }
     if let Some(t) = copied {
         ui.ctx().copy_text(t);
     }
 
     // ⌘C / Ctrl+C 复制选中行（编辑器习惯）。检索框获得焦点时由 TextEdit 先消费该快捷键。
+    // 仅**活动面板**响应：多个面板各自调用 `show`，若都不加区分，`consume_shortcut` 会被先渲染的
+    // 面板一次性消费掉，导致后面的面板永远收不到（spec §7.7.7 的「先到先得」问题）。
     let copy_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C);
-    if ui.input_mut(|i| i.consume_shortcut(&copy_shortcut))
-        && let Some(row) = state.selected_row
+    if pane_id == state.active_pane
+        && ui.input_mut(|i| i.consume_shortcut(&copy_shortcut))
+        && let Some(row) = pane.selected_row
     {
         ui.ctx()
-            .copy_text(row_content(state, row, in_result).0.into_owned());
+            .copy_text(row_content(state, fileset, row, in_result).0.into_owned());
     }
 }
 
 /// 取第 `row` 行的文本与行号槽文本。
 ///
 /// 全量视图下 `row` 是全局行号；命中视图下是命中索引，行号显示为 `<文件序>.<行号>`。
-fn row_content(state: &AppState, row: usize, in_result: bool) -> (Cow<'_, str>, String) {
+fn row_content<'a>(
+    state: &'a AppState,
+    fileset: &'a FileSet,
+    row: usize,
+    in_result: bool,
+) -> (Cow<'a, str>, String) {
     if in_result {
         let hit = state.search_results[row];
-        let line = state
-            .fileset
+        let line = fileset
             .file(hit.file_idx as usize)
             .and_then(|f| f.line(hit.line_idx as usize))
             .unwrap_or_default();
         (line, format!("{}.{}", hit.file_idx + 1, hit.line_idx + 1))
     } else {
-        let line = state.fileset.line(row).unwrap_or_default();
+        let line = fileset.line(row).unwrap_or_default();
         (line, (row + 1).to_string())
     }
 }

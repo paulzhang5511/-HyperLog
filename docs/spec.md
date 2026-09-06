@@ -563,6 +563,54 @@ pub fn segments<'a>(line: &'a str, h: &Highlighter) -> Vec<Segment<'a>>;
 | ⌘G / ⌘↵ | 触发查找 | 等价「查找」按钮（非空模式且非检索中） |
 | ⌘B | 切换侧边栏 | `show_sidebar = !show_sidebar` |
 | Esc | 返回 | 命中视图→全量日志；否则清除选中行 |
+| ⌘\ | 向右拆分面板 | 面板数 < [`MAX_PANES`](#777-拆分面板) 时新增 |
+
+### 7.7.7 拆分面板（对比视图）
+
+参考 VSCode 的编辑器组，中央区可拆为多个面板，便于**并排对比日志**（同一日志的不同位置，
+或两份不同日志）。
+
+**数据模型**（`src/app.rs`）
+
+- 抽出 `PaneState`，承载「每个面板独立持有」的状态：
+
+  | 字段 | 说明 |
+  |------|------|
+  | `fileset_override: Option<FileSet>` | `None` = 共享全局 `AppState::fileset`；`Some` = 该面板单独打开的文件集 |
+  | `selected_row: Option<usize>` | 该面板选中行（全量=全局行号，命中视图=命中索引） |
+  | `scroll_target: Option<usize>` | 待跳转行号，由该面板自己消费 |
+  | `wrap: bool` | 折行开关（每面板独立） |
+  | `max_line_width: f32` | 估算的最长行宽（决定横向滚动范围） |
+  | `in_result_mode: bool` | 是否显示检索命中视图（可做到「A 面板全量 + B 面板命中」对比） |
+
+- 全局共享、不进 `PaneState`：`fileset`（默认文件集）、`highlighter`、`search_*`、`hit_regex`、
+  `pending_*`、`prefs`、`recents`、`dirty_files`、`show_sidebar`、`show_results`、`line_jump`。
+- `PaneLayout { dir: SplitDir, count: usize }`：`dir` 为 `Horizontal`（左右）/ `Vertical`（上下），
+  `count` 为 `1..=MAX_PANES`（常量 `MAX_PANES = 4`）。`count == 4` 时渲染为 **2×2 网格**
+  （外层按 `dir` 切 2 份，每份再按垂直方向切 2 份）。
+
+**渲染约束**
+
+- egui 只允许**一个 `CentralPanel`** 吃掉剩余空间 → 拆分必须在其内部做，用
+  `ui.new_child(egui::UiBuilder { max_rect })` 手工切分矩形（egui 0.36 已移除 `child_ui` /
+  `allocate_ui_at_rect`，改用 `new_child`；不用 `ui.columns`，它无法精确控制分隔线）。
+- `log_view::show` 签名改为 `show(ui, &AppState, &mut PaneState, pane_id)`，并把两处
+  **「先到先得」的全局消费**改为按面板隔离：`scroll_target` 用 `take()`（改为面板字段后天然隔离）、
+  ⌘C 复制用 `consume_shortcut` 加 `pane_id` 判定的活动面板守卫——否则面板 A 吃掉后面板 B 永远收不到。
+- 滚动位置**无需自管**：egui `ScrollArea` 按 `Id` 存自己的 Memory，两个面板处于不同
+  `push_id` 容器下，滚动偏移天然独立。
+
+**交互语义**
+
+- `active_pane: usize` 标记活动面板（点击面板即激活，标题栏高亮）。
+  侧边栏点击文件、行号跳转（⌘L）、查找结果跳转（`pending_grep_jump`）**只作用于活动面板**。
+- 每面板标题栏：显示当前文件（共享全局时显示「N 个文件」或高亮文件名；单独打开时显示该文件名）、
+  「本面板打开」按钮（写 `fileset_override`，把单个文件单独载入此面板，与全局文件集脱钩，便于对比两份不同日志）、
+  已单独打开的面板显示「共享」按钮返回全局文件集、关闭按钮（`count > 1` 时可关）。
+  点击标题条或正文行即激活该面板（标题条高亮 + 描边）。
+- `load_paths` / `reload_all` 清视图态时**遍历所有面板**；`fileset_override` 一并清空（文档已换，
+  旧坐标失效）。
+- 拆分状态（`dir` / `count`）写入 `Prefs` 持久化。
 
 ### 7.8 `core::export` —— 流式导出（修复 D8 / G8）
 
@@ -903,7 +951,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 
 每个任务遵循：≤ 5 个文件、带验收标准与验证命令（命令清单见 §5，任务清单见 `docs/tasks.md`）。
 
-### 12.1 实施进度（截至 2026-09-02）
+### 12.1 实施进度（截至 2026-09-06）
 
 | 里程碑 | 状态 | 提交 |
 | --- | --- | --- |
@@ -926,6 +974,7 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | **M15** | ✅ 完成 | 见 §14（Q6 外部文件修改检测：状态栏告警 + 重新加载） |
 | **M16** | ✅ 完成 | 见 §14（GUI 验收首轮实机/无头观测 P4/P5/P6 + 观测开关：`--open`/`HYPER_LOG_REPAINT`/`HYPER_LOG_PERF_LOG`） |
 | **M17** | ✅ 完成 | 见 §14（用户偏好持久化：主题/窗口几何/折行/侧栏/最近检索词，`core/prefs.rs` 零依赖 `std::fs` + 容错解析 + 原子写） |
+| **M18** | ✅ 完成 | 见 §14（拆分面板对比视图：左右/上下最多 4 面板、每面板独立折行/选中/滚动/命中视图、单文件独立打开） |
 
 > 说明：M1/M2 合并于同一提交，因为 `core::indexer` 的 API 必须被 UI 消费后才不会触发
 > `clippy -D warnings` 的 dead_code 门禁，单独提交索引器会使 CI 在合并前变红。
@@ -988,3 +1037,4 @@ scripts/gen_log.sh /tmp/bench_1gb.log 10_000_000   # ≈ 1 GB
 | 2026-09-05 | 支持无后缀日志文件：`dirscan::is_log_file` 由「仅 .log/.txt/.out」改为「扩展名为日志类型**或无扩展名**即视为日志候选」（现实中不少日志无后缀，如 `access`/`debug`/`foo.log.1` 滚动归档）；`app.rs::open_files` 文件对话框新增「所有文件 (*)」过滤器以便选择无后缀文件；`open_directory`/`grepdir` 的「未找到日志文件」提示同步改为「.log/.txt/.out 或无后缀」。§7.7.1 同步。`dirscan` 测试补无后缀文件（`noext`/`debug`）应被收集、无关后缀（`.md`/`.zip`）仍跳过的断言 | Agent |
 | 2026-09-05 | ① **支持无后缀日志文件**：`dirscan::is_log_file` 由「仅 .log/.txt/.out」改为「扩展名为日志类型**或无扩展名**即视为日志候选」；`app.rs::open_files` 文件对话框新增「所有文件 (*)」过滤器；`open_directory`/`grepdir` 提示同步。新增 fixture `tests/fixtures/no_extension` 与单测 `no_extension_file_is_indexed_normally`。② **命令行支持打开目录**：`App::expand_initial_paths` 在 `new()` 中把初始路径里的目录递归展开为日志文件（复用 `dirscan`），使 `hyper-log <dir>` 与「打开目录」等价，§7.7.1 补契约。③ **滚动方向锁定**：修「上下滑动时正文左右漂移」——egui `ScrollArea` 对 x/y 独立累加 delta 无主控方向判定，`lock_scroll_axis` 按 `AXIS_LOCK_RATIO=0.3` 清零次要分量，纯逻辑抽 `locked_scroll_delta` 并补 4 个单测。§7.7 补契约。单测 58→63，门禁 fmt/clippy(-D warnings)/窗口冒烟 ALIVE 均绿 | Agent |
 | 2026-09-05 | 发布 0.0.4：版本号 `Cargo.toml`/`Cargo.lock`/`docs/prd.md` 0.0.3→0.0.4。本版本相对 0.0.3 的变更：① 支持无后缀日志文件（目录扫描/查找全部纳入无扩展名文件，单文件对话框加「所有文件 (*)」过滤器）；② 命令行支持直接传目录（递归展开为日志文件）；③ 修复触控板上下滑动时正文左右漂移（滚动方向锁定）；④ 查找结果浮动窗口可移动、宽度取主窗口 80% | Agent |
+| 2026-09-06 | M18 拆分面板对比视图（参考 VSCode 编辑器组，spec §7.7.7）：① **数据模型**——抽出 `PaneState`（`fileset_override`/`selected_row`/`scroll_target`/`wrap`/`max_line_width`/`in_result_mode`），每面板独立持有视图态；`AppState` 删全局 `wrap`/`selected_row`/`scroll_target`/`max_line_width`，改加 `panes: Vec<PaneState>`、`pane_layout: PaneLayout{dir,count}`、`active_pane`；`PaneLayout.dir` 为 `SplitDir{Horizontal,Vertical}`、`MAX_PANES=4`（count==4 渲染 2×2 网格）；拆分状态（`split_dir`/`split_count`，clamp 1..=4）写入 `Prefs` 持久化。② **渲染**——egui 只允许一个 `CentralPanel`，拆分在其内部用 `ui.new_child(UiBuilder{max_rect,..})` 手工切分矩形（egui 0.36 已移除 `child_ui`/`allocate_ui_at_rect`）；`log_view::show` 签名改 `(ui, &AppState, &mut PaneState, pane_id)`，两处「先到先得」全局消费改按面板隔离（`scroll_target` 用 `take()`、⌘C 复制加活动面板守卫）。③ **交互**——`active_pane` 标记活动面板（点击标题条/正文即激活并高亮）；工具栏新增拆分方向/关闭面板按钮；每面板标题栏含「本面板打开」（写 `fileset_override` 单独载入文件，与全局文件集脱钩，便于对比两份不同日志）、「共享」（返回全局文件集）、「关闭」（count>1 可关）；侧边栏跳转/⌘L/查找结果跳转只作用于活动面板；`load_paths`/`reload_all` 清态时遍历所有面板并清空 `fileset_override`。④ egui 0.36 API 修正：`child_ui`→`new_child(UiBuilder)`、`available_rect_before_put`→`available_rect_before_wrap`。门禁 fmt/clippy(-D warnings)/63 单测全绿 | Agent |

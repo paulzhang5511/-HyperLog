@@ -20,6 +20,90 @@ const MAX_MSG_PER_FRAME: usize = 1000;
 /// 检索命中上限（G6）。
 const MAX_HITS: usize = 2_000_000;
 
+/// 单个面板最多显示多少个（2×2 网格上限，与 VSCode 编辑器组的实用密度一致）。
+pub const MAX_PANES: usize = 4;
+
+/// 拆分方向。
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum SplitDir {
+    /// 左右并排。
+    #[default]
+    Horizontal,
+    /// 上下并排。
+    Vertical,
+}
+
+impl SplitDir {
+    /// 垂直方向的反向（2×2 网格的内层用）。
+    fn perpendicular(self) -> Self {
+        match self {
+            Self::Horizontal => Self::Vertical,
+            Self::Vertical => Self::Horizontal,
+        }
+    }
+}
+
+/// 面板布局：`count` 个面板按 `dir` 均分；`count == 4` 时渲染为 2×2 网格。
+#[derive(Clone, Debug)]
+pub struct PaneLayout {
+    /// 拆分方向（`count == 4` 时用作外层方向）。
+    pub dir: SplitDir,
+    /// 面板数量，恒在 `1..=MAX_PANES`。
+    pub count: usize,
+}
+
+impl Default for PaneLayout {
+    fn default() -> Self {
+        Self {
+            dir: SplitDir::Horizontal,
+            count: 1,
+        }
+    }
+}
+
+impl PaneLayout {
+    /// 向右/向下新增一个面板（已达上限则无操作）。
+    pub fn split(&mut self, dir: SplitDir) {
+        if self.count >= MAX_PANES {
+            return;
+        }
+        if self.count == 1 {
+            self.dir = dir; // 从单面板拆分时决定方向
+        }
+        self.count += 1;
+    }
+
+    /// 关闭一个面板（最少保留一个）；返回被关闭面板的索引（调用方据此修正 `active_pane`）。
+    pub fn close(&mut self, index: usize) -> bool {
+        if self.count <= 1 || index >= self.count {
+            return false;
+        }
+        self.count -= 1;
+        true
+    }
+}
+
+/// 单个日志面板的状态。
+///
+/// 从 `AppState` 抽出的「每面板独立持有」部分：拆成多个面板后，选中行、跳转目标、
+/// 折行、横向滚动范围、视图模式都应当各自独立，否则两个面板会互相干扰（例如 A 面板
+/// 消费掉 `scroll_target` 后 B 面板永远收不到跳转）。
+#[derive(Clone, Default)]
+pub struct PaneState {
+    /// 该面板单独打开的文件集；`None` 表示共享全局 `AppState::fileset`。
+    pub fileset_override: Option<FileSet>,
+    /// 选中行（全量视图为该文件集的全局行号，命中视图为命中索引）。
+    pub selected_row: Option<usize>,
+    /// 待跳转行号，由该面板自己消费（替代原先的全局 `AppState::scroll_target`）。
+    pub scroll_target: Option<usize>,
+    /// 折行开关（每面板独立）。
+    pub wrap: bool,
+    /// 估算的最长行渲染宽度，用于固定横向滚动范围。
+    pub max_line_width: f32,
+    /// 是否显示检索命中视图（可做到「A 面板全量 + B 面板命中」的对比）。
+    pub in_result_mode: bool,
+}
+
 /// 应用的全部可变状态。UI 各面板只借用它的引用，不持有状态本身。
 #[derive(Default)]
 pub struct AppState {
@@ -30,11 +114,22 @@ pub struct AppState {
     /// 着色器：级别高亮（检索时复用同一 `Regex` 做命中高亮）。
     pub highlighter: crate::highlight::Highlighter,
     /// 是否启用折行显示（默认关闭，横向滚动；见 spec G7）。
+    /// **当前活动面板**的镜像，方便工具栏/状态栏读写；真实来源见 [`panes`]。
     pub wrap: bool,
     /// 当前选中的行（全量视图为全局行号，命中视图为命中索引），供高亮与复制使用。
+    /// **当前活动面板**的镜像，方便状态栏/快捷键读写；真实来源见 [`panes`]。
     pub selected_row: Option<usize>,
     /// 估算的最长行渲染宽度（像素），用于固定横向滚动范围，避免滚动条随虚拟滚动抖动。
+    /// **当前活动面板**的镜像，真实来源见 [`panes`]。
     pub max_line_width: f32,
+
+    // —— 拆分面板（spec §7.7.7）——
+    /// 所有面板的独立状态，下标即面板 id。
+    pub panes: Vec<PaneState>,
+    /// 面板布局（方向 + 数量）。
+    pub pane_layout: PaneLayout,
+    /// 当前活动面板下标（点击面板激活；跳转类操作只作用于它）。
+    pub active_pane: usize,
     /// toolbar 置位后，在 `ui` 中弹出打开文件对话框。
     pub pending_open: bool,
     /// 最近打开的文件列表（M11 / spec Q3），持久化在平台配置目录。
@@ -43,6 +138,9 @@ pub struct AppState {
     pub pending_open_recent: Option<PathBuf>,
     /// toolbar 置位后，在 `ui` 中弹出「打开目录」对话框（Q「打开目录」）。
     pub pending_open_dir: bool,
+    /// 面板标题栏「本面板打开」置位后，在 `ui` 中弹出文件对话框，把该文件单独载入此面板
+    /// （写入 `panes[idx].fileset_override`，与全局文件集脱钩，便于对比两份不同日志）。
+    pub pending_open_in_pane: Option<usize>,
 
     // —— 检索相关 ——
     /// 检索关键字。
@@ -122,8 +220,7 @@ pub struct AppState {
     // —— 行号跳转（spec §7.7 行跳转）——
     /// 行号跳转输入框的缓冲区（1-based 全局行号）。
     pub line_jump: String,
-    /// 待跳转到的全局行号（消费后清空）；`log_view` 据此滚动并高亮。
-    pub scroll_target: Option<usize>,
+    /// 待跳转行号由**活动面板**自己持有（[`PaneState::scroll_target`]），见 [`AppState::jump_to_row`]。
 
     // —— 快捷键焦点请求 ——
     /// 请求把焦点移到检索输入框（⌘F），由 `toolbar` 在下一帧落实。
@@ -165,7 +262,90 @@ impl AppState {
         let mut p = self.prefs.clone();
         p.wrap = self.wrap;
         p.sidebar_visible = self.show_sidebar;
+        // 拆分布局：数量与方向一并持久化（`split_vertical` 用 bool 表达，避免 core 依赖 egui）。
+        p.split_count = self.pane_layout.count;
+        p.split_vertical = self.pane_layout.dir == SplitDir::Vertical;
         p.save();
+    }
+
+    // —— 拆分面板辅助（spec §7.7.7）——
+
+    /// 确保 `panes` 至少覆盖布局所需的数量（新增的面板取默认状态）。
+    pub fn ensure_panes(&mut self) {
+        let need = self.pane_layout.count.max(1);
+        if self.panes.len() < need {
+            self.panes.resize_with(need, PaneState::default);
+        }
+        if self.active_pane >= self.panes.len() {
+            self.active_pane = self.panes.len() - 1;
+        }
+    }
+
+    /// 活动面板的可变引用（越界时回退到第一个）。
+    pub fn active_pane_mut(&mut self) -> &mut PaneState {
+        let i = self.active_pane.min(self.panes.len().saturating_sub(1));
+        &mut self.panes[i]
+    }
+
+    /// 活动面板的不可变引用。
+    pub fn active_pane(&self) -> Option<&PaneState> {
+        self.panes.get(self.active_pane)
+    }
+
+    /// 请求把**活动面板**跳转到指定行（侧边栏点击、行号跳转、查找结果跳转都走这里）。
+    pub fn jump_to_row(&mut self, row: usize) {
+        if let Some(p) = self.panes.get_mut(self.active_pane) {
+            p.scroll_target = Some(row);
+        }
+    }
+
+    /// 清空所有面板的视图态（文档被替换/重载时调用：旧的行号坐标已失效）。
+    pub fn clear_pane_view_states(&mut self) {
+        for p in &mut self.panes {
+            p.selected_row = None;
+            p.scroll_target = None;
+            p.max_line_width = 0.0;
+            p.fileset_override = None;
+        }
+    }
+
+    /// 向右（`SplitDir::Horizontal`）或向下（`Vertical`）拆分出一个新面板。
+    pub fn split_pane(&mut self, dir: SplitDir) {
+        self.pane_layout.split(dir);
+        self.ensure_panes();
+        self.active_pane = self.pane_layout.count - 1; // 新面板即活动面板
+        self.sync_active_pane_mirror();
+    }
+
+    /// 关闭指定面板；至少保留一个。被关的是活动面板时把活动权交给前一个。
+    pub fn close_pane(&mut self, index: usize) {
+        if !self.pane_layout.close(index) {
+            return;
+        }
+        if index < self.panes.len() {
+            self.panes.remove(index);
+        }
+        self.active_pane = self.active_pane.min(self.panes.len().saturating_sub(1));
+        self.sync_active_pane_mirror();
+    }
+
+    /// 把活动面板的 `wrap`/`selected_row`/`max_line_width`/`in_result_mode` 同步到 `AppState`
+    /// 顶层镜像字段（工具栏、状态栏、快捷键读的是这些镜像，避免它们关心面板下标）。
+    pub fn sync_active_pane_mirror(&mut self) {
+        let (wrap, sel, w, res) = match self.active_pane() {
+            Some(p) => (p.wrap, p.selected_row, p.max_line_width, p.in_result_mode),
+            None => (false, None, 0.0, false),
+        };
+        self.wrap = wrap;
+        self.selected_row = sel;
+        self.max_line_width = w;
+        self.in_result_mode = res;
+    }
+
+    /// 把顶层镜像的 `wrap` 写回活动面板（工具栏切换折行时调用）。
+    pub fn apply_wrap_to_active_pane(&mut self) {
+        let wrap = self.wrap;
+        self.active_pane_mut().wrap = wrap;
     }
 }
 
@@ -253,8 +433,20 @@ impl LogViewerApp {
             grep_cancel: None,
         };
         // 回填实时开关（折行/侧栏）：持久化的是唯一真相，实时字段初值取自偏好。
-        app.state.wrap = app.state.prefs.wrap;
         app.state.show_sidebar = app.state.prefs.sidebar_visible;
+        // 面板：布局（方向/数量）从偏好恢复，并确保 panes 覆盖布局所需数量。
+        app.state.pane_layout = PaneLayout {
+            dir: if app.state.prefs.split_vertical {
+                SplitDir::Vertical
+            } else {
+                SplitDir::Horizontal
+            },
+            count: app.state.prefs.split_count.clamp(1, MAX_PANES),
+        };
+        app.state.ensure_panes();
+        // 折行是每面板独立的状态，初值取自偏好后同步进活动面板。
+        app.state.wrap = app.state.prefs.wrap;
+        app.state.apply_wrap_to_active_pane();
         // 启动即载入（命令行 `--open`/位置参数）：M16 为支撑实机观测与「终端秒开日志」而加。
         // 目录在此展开为日志文件列表，使 `hyper-log <dir>` 与「打开目录」等价。
         let initial_paths = Self::expand_initial_paths(initial_paths);
@@ -323,12 +515,19 @@ impl LogViewerApp {
         {
             self.state.pending_search = true;
         }
-        // Esc：退出命中视图（返回全量日志）；否则清除选中行。
+        // Esc：退出**活动面板**的命中视图（返回全量日志）；否则清除活动面板选中行。
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.state.in_result_mode && !self.state.search_results.is_empty() {
+            let active_in_res = self
+                .state
+                .active_pane()
+                .map(|p| p.in_result_mode)
+                .unwrap_or(false);
+            if active_in_res && !self.state.search_results.is_empty() {
+                self.state.active_pane_mut().in_result_mode = false;
                 self.state.in_result_mode = false;
             } else {
                 self.state.selected_row = None;
+                self.state.active_pane_mut().selected_row = None;
             }
         }
     }
@@ -454,15 +653,16 @@ impl LogViewerApp {
         self.state.search_truncated = false;
         self.state.search_error = None;
         self.state.hit_regex = None;
-        self.state.in_result_mode = false;
+        // 视图态是每面板独立持有的，必须遍历清空（含各面板单独打开的文件集）。
+        self.state.clear_pane_view_states();
         self.state.selected_row = None;
-        self.state.scroll_target = None;
         self.state.sidebar_active_file = None;
         self.state.dirty_files.clear();
 
-        // 新文件可能比已加载的更宽，重新估算横向滚动范围。
+        // 新文件可能比已加载的更宽，重新估算横向滚动范围（活动面板）。
         let max_line_width = log_view::estimate_content_width(&self.state.fileset);
         self.state.max_line_width = max_line_width;
+        self.state.active_pane_mut().max_line_width = max_line_width;
 
         let total = self.state.fileset.total_lines();
         let size = crate::util::human_bytes(self.state.fileset.total_bytes() as u64);
@@ -492,8 +692,9 @@ impl LogViewerApp {
             return;
         }
         self.state.fileset.clear();
+        // 视图态是每面板独立持有的，重载后旧行号坐标失效，遍历清空。
+        self.state.clear_pane_view_states();
         self.state.selected_row = None;
-        self.state.scroll_target = None;
         self.state.sidebar_active_file = None;
         self.state.dirty_files.clear();
         self.state.status_text = "重新加载中…".to_owned();
@@ -530,7 +731,10 @@ impl LogViewerApp {
         self.state.search_error = None;
         self.state.search_truncated = false;
         self.state.search_progress = (0, self.state.fileset.total_bytes() as u64);
-        self.state.in_result_mode = true;
+        // 检索结果视图是「每面板独立」的：发起检索时把**活动面板**切到命中视图，
+        // 其它面板保持全量，从而可以做到「A 面板全量 + B 面板命中」的并排对比（spec §7.7.7）。
+        self.state.active_pane_mut().in_result_mode = true;
+        self.state.in_result_mode = true; // 顶层镜像
         self.state.hit_regex = hit_re;
         self.state.status_text = "检索中…".to_owned();
 
@@ -631,7 +835,9 @@ impl LogViewerApp {
             return;
         };
         let row = start + local;
-        self.state.scroll_target = Some(row);
+        // 跳转只作用于活动面板（spec §7.7.7）。
+        self.state.jump_to_row(row);
+        self.state.active_pane_mut().selected_row = Some(row);
         self.state.selected_row = Some(row);
         self.state.sidebar_active_file = Some(file_idx);
     }
@@ -792,6 +998,7 @@ impl LogViewerApp {
                 self.state.is_searching = false;
                 self.search_cancel = None;
                 self.state.search_error = Some(error_text(&e));
+                self.state.active_pane_mut().in_result_mode = false;
                 self.state.in_result_mode = false;
                 self.state.status_text = "检索失败，见检索框下方提示".to_owned();
             }
@@ -915,6 +1122,36 @@ impl eframe::App for LogViewerApp {
             self.state.pending_open_dir = false;
             self.open_directory();
         }
+        // 面板标题栏「本面板打开」：把单个文件单独载入该面板（写入 `fileset_override`），
+        // 与全局文件集脱钩，便于对比两份不同日志。检索中禁用（G1）。
+        if let Some(pane_idx) = self.state.pending_open_in_pane.take()
+            && !self.state.is_searching
+        {
+            let picked = rfd::FileDialog::new()
+                .set_title("在本面板打开日志文件")
+                .add_filter("日志文件", &["log", "txt", "out"])
+                .add_filter("所有文件", &["*"])
+                .pick_file();
+            if let Some(path) = picked {
+                match LogFileIndex::open(&path) {
+                    Ok(idx) => {
+                        let mut fs = crate::core::indexer::FileSet::default();
+                        fs.push(std::sync::Arc::new(idx));
+                        // 文档换成单独文件，旧的行号坐标失效，清该面板视图态。
+                        let pane = &mut self.state.panes[pane_idx];
+                        pane.fileset_override = Some(fs);
+                        pane.selected_row = None;
+                        pane.scroll_target = None;
+                        pane.max_line_width = 0.0; // 惰性重算
+                        self.state.status_text =
+                            format!("面板 {} 已单独打开 {}", pane_idx + 1, path.display());
+                    }
+                    Err(e) => {
+                        self.state.status_text = format!("无法打开 {}: {e}", path.display());
+                    }
+                }
+            }
+        }
         // 查找全部：弹出目录选择，选中后启动目录检索（与普通检索互斥）。
         if self.state.pending_grep && !self.state.is_searching && !self.state.is_grepping {
             self.state.pending_grep = false;
@@ -1004,11 +1241,12 @@ impl eframe::App for LogViewerApp {
         }
         // 日志区用编辑器正文底色（与顶栏/底栏区分），且不留窗口内边距：
         // 行号槽要从最左侧开始，否则整块行背景会与正文错位。
+        // 多面板拆分在中央区内按布局均分（spec §7.7.7）。
         let bg = theme::palette(ui.ctx()).bg;
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(bg))
             .show(ui, |ui| {
-                log_view::show(ui, &mut self.state);
+                render_log_area(ui, &mut self.state);
             });
 
         // 目录检索结果：独立浮动窗口（notepad++ 风格），不再挤压正文日志区布局。
@@ -1087,6 +1325,217 @@ impl eframe::App for LogViewerApp {
                         }
                     }
                 });
+        }
+    }
+}
+
+/// 在中央区渲染全部日志面板（VSCode 风格拆分，spec §7.7.7）。
+///
+/// 各面板独立持有选中行 / 跳转 / 折行 / 视图模式；点击面板的标题条或正文行即激活该面板，
+/// 跳转类操作只作用于活动面板。最多 [`MAX_PANES`] 个，按 [`PaneLayout`] 均分或 2×2 网格。
+///
+/// 关闭面板请求在本函数内就地处理（布局数量减一、活动权交给前一个），并立即停止本帧剩余渲染
+/// （避免关闭后面板下标失效导致越界）。
+fn render_log_area(ui: &mut egui::Ui, state: &mut AppState) {
+    state.ensure_panes();
+    let n = state.pane_layout.count.clamp(1, MAX_PANES);
+    let dir = state.pane_layout.dir;
+    let closed = match n {
+        1 => render_one_in_rect(ui, ui.available_rect_before_wrap(), state, 0),
+        2 => split_panes(ui, state, &[0, 1], dir),
+        3 => {
+            let rect = ui.available_rect_before_wrap();
+            let (r0, r1) = halve(rect, dir);
+            if let Some(id) = render_one_in_rect(ui, r0, state, 0) {
+                Some(id)
+            } else {
+                let mut child = ui.new_child(egui::UiBuilder {
+                    max_rect: Some(r1),
+                    layout: Some(*ui.layout()),
+                    ..Default::default()
+                });
+                split_panes(&mut child, state, &[1, 2], dir.perpendicular())
+            }
+        }
+        4 => {
+            let rect = ui.available_rect_before_wrap();
+            let (r0, r1) = halve(rect, dir);
+            let mut c0 = ui.new_child(egui::UiBuilder {
+                max_rect: Some(r0),
+                layout: Some(*ui.layout()),
+                ..Default::default()
+            });
+            if let Some(id) = split_panes(&mut c0, state, &[0, 1], dir.perpendicular()) {
+                Some(id)
+            } else {
+                let mut c1 = ui.new_child(egui::UiBuilder {
+                    max_rect: Some(r1),
+                    layout: Some(*ui.layout()),
+                    ..Default::default()
+                });
+                split_panes(&mut c1, state, &[2, 3], dir.perpendicular())
+            }
+        }
+        _ => None,
+    };
+    // 关闭面板：布局数量减一，活动权交给前一个（close_pane 内部处理）。
+    if let Some(id) = closed {
+        state.close_pane(id);
+    }
+    // 渲染后统一把活动面板的视图态同步回顶层镜像（工具栏 / 状态栏 / 快捷键读取）。
+    state.sync_active_pane_mirror();
+}
+
+/// 把一个方向下的若干面板均分到当前 `ui` 的可用矩形（仅处理 1 或 2 个；更多由调用方递归）。
+fn split_panes(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    ids: &[usize],
+    dir: SplitDir,
+) -> Option<usize> {
+    match ids.len() {
+        1 => render_one_pane(ui, state, ids[0]),
+        2 => {
+            let rect = ui.available_rect_before_wrap();
+            let (r0, r1) = halve(rect, dir);
+            if let Some(id) = render_one_in_rect(ui, r0, state, ids[0]) {
+                return Some(id);
+            }
+            render_one_in_rect(ui, r1, state, ids[1])
+        }
+        _ => {
+            for &id in ids {
+                if let Some(closed) = render_one_pane(ui, state, id) {
+                    return Some(closed);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// 按方向把矩形对半切（返回左/右或上/下两部分）。
+fn halve(rect: egui::Rect, dir: SplitDir) -> (egui::Rect, egui::Rect) {
+    match dir {
+        SplitDir::Horizontal => rect.split_left_right_at_x(rect.left() + rect.width() / 2.0),
+        SplitDir::Vertical => rect.split_top_bottom_at_y(rect.top() + rect.height() / 2.0),
+    }
+}
+
+/// 在给定矩形内渲染单个面板（标题条 + 正文）。
+fn render_one_in_rect(
+    parent: &mut egui::Ui,
+    rect: egui::Rect,
+    state: &mut AppState,
+    pane_id: usize,
+) -> Option<usize> {
+    let mut child = parent.new_child(egui::UiBuilder {
+        max_rect: Some(rect),
+        layout: Some(*parent.layout()),
+        ..Default::default()
+    });
+    render_one_pane(&mut child, state, pane_id)
+}
+
+/// 渲染单个日志面板：标题条（文件名 + 关闭按钮 + 激活态高亮） + 正文。
+///
+/// 返回 `Some(pane_id)` 表示用户点了标题条的关闭按钮，由上层关闭面板。
+fn render_one_pane(ui: &mut egui::Ui, state: &mut AppState, pane_id: usize) -> Option<usize> {
+    let is_active = state.active_pane == pane_id;
+    let p = theme::palette(ui.ctx());
+
+    // —— 标题条：点击激活、显示文件、本面板打开 / 返回共享 / 关闭按钮 ——
+    let close_clicked = egui::Frame::default()
+        .inner_margin(egui::vec2(4.0, 2.0))
+        .fill(if is_active { p.row_active } else { p.panel })
+        .show(ui, |ui| {
+            let title = pane_title(state, pane_id);
+            // 点击标题条（非按钮区）激活该面板。
+            let label = ui.selectable_label(is_active, title);
+            if label.clicked() && !is_active {
+                state.active_pane = pane_id;
+                state.sync_active_pane_mirror();
+            }
+            let mut closed = false;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if state.pane_layout.count > 1 && ui.small_button("✕").clicked() {
+                    closed = true;
+                }
+                // 该面板已单独打开文件 → 提供「返回共享」；否则提供「本面板打开」单独载入一个文件。
+                if state.panes[pane_id].fileset_override.is_some() {
+                    if ui
+                        .small_button("共享")
+                        .on_hover_text("改回共享全局文件集")
+                        .clicked()
+                    {
+                        state.panes[pane_id].fileset_override = None;
+                        state.panes[pane_id].selected_row = None;
+                        state.panes[pane_id].scroll_target = None;
+                        state.panes[pane_id].max_line_width = 0.0; // 惰性重算
+                    }
+                } else if ui
+                    .small_button("本面板")
+                    .on_hover_text("在本面板单独打开一个日志文件（与全局文件集脱钩）")
+                    .clicked()
+                {
+                    state.pending_open_in_pane = Some(pane_id);
+                }
+            });
+            closed
+        })
+        .inner;
+
+    // —— 正文：编辑器风格日志区 ——
+    egui::Frame::default()
+        .inner_margin(0.0)
+        .outer_margin(0.0)
+        // 活动面板描边高亮，非活动用细边框区分（VSCode 编辑器组选中态）。
+        .stroke(if is_active {
+            egui::Stroke::new(2.0, p.accent)
+        } else {
+            egui::Stroke::new(1.0, p.border)
+        })
+        .show(ui, |ui| {
+            let before = state.panes[pane_id].selected_row;
+            let mut pane = state.panes[pane_id].clone();
+            crate::ui::log_view::show(ui, &*state, &mut pane, pane_id);
+            // 点击正文行会更新该面板的 selected_row：若发生变化，把此面板设为活动面板，
+            // 使跳转 / 复制 / 折行等后续操作作用于它（spec §7.7.7）。
+            let row_clicked = pane.selected_row != before;
+            state.panes[pane_id] = pane;
+            if row_clicked && !is_active {
+                state.active_pane = pane_id;
+                state.sync_active_pane_mirror();
+            }
+        });
+
+    if close_clicked { Some(pane_id) } else { None }
+}
+
+/// 面板的标题文字：共享文件集显示当前高亮文件名（或文件数），单独打开的文件集显示其文件名。
+fn pane_title(state: &AppState, pane_id: usize) -> String {
+    let pane = &state.panes[pane_id];
+    if let Some(fs) = &pane.fileset_override {
+        let n = fs.file_count();
+        if n == 1 {
+            fs.file(0)
+                .and_then(|f| f.path.file_name().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "单独文件".to_owned())
+        } else {
+            format!("{n} 个文件（单独）")
+        }
+    } else {
+        let n = state.fileset.file_count();
+        if n == 0 {
+            "未打开文件".to_owned()
+        } else if let Some(idx) = state.sidebar_active_file {
+            state
+                .fileset
+                .file(idx)
+                .and_then(|f| f.path.file_name().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| format!("{n} 个文件"))
+        } else {
+            format!("{n} 个文件")
         }
     }
 }
