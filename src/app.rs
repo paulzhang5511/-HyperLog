@@ -23,6 +23,10 @@ const MAX_HITS: usize = 2_000_000;
 /// 单个面板最多显示多少个（2×2 网格上限，与 VSCode 编辑器组的实用密度一致）。
 pub const MAX_PANES: usize = 4;
 
+/// 面板标题条高度（px）。比 18px 的图标命中区略高，让图标垂直居中；
+/// 固定值也让「先铺背景、再画内容」的绘制顺序（见 `render_one_pane`）易于实现。
+const TITLE_BAR_HEIGHT: f32 = 20.0;
+
 /// 拆分方向。
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum SplitDir {
@@ -1765,100 +1769,109 @@ fn render_one_pane(ui: &mut egui::Ui, state: &mut AppState, pane_id: usize) -> O
     let is_active = state.active_pane == pane_id;
     let p = theme::palette(ui.ctx());
 
-    // —— 标题条：点击激活、显示文件、本面板打开 / 返回共享 / 关闭按钮 ——
+    // —— 标题条：点击激活、显示文件名 + 右侧图标（本面板打开/返回共享、拆分、关闭）——
     //
-    // 不能用 `Frame::show`：`Frame::begin` 会把**整个面板高度**作为 content_ui 的 max_rect，
-    // 而标题条里垂直居中的 `selectable_label` 会把 min_rect 撑满整个高度，导致 `Frame::end`
-    // 把父 ui 的 cursor 推进到面板底部 —— 正文就只剩 0 高度（内容不显示的根因）。
-    // 这里用 `horizontal` 手动布局，标题条只占自然高度，正文再取剩余矩形。
-    let title_top = ui.cursor().min.y;
+    // **绘制顺序（关键）**：egui 的 `Painter` 把 shape 按调用顺序压进同一图层，
+    // **后压的盖住先压的**。若像早期版本那样「先在 `horizontal` 内画文件名/图标 →
+    // 再在 `horizontal` 之后铺标题条背景」，背景会把标题条内容整个盖掉，表现为
+    // 「标题条一片空白、图标完全不可见」（用户反馈「没实现」的根因）。
+    // 因此这里先用 `allocate_ui_with_layout` 定下固定高度的标题条矩形，
+    // **先铺背景**，再在其上画内容。
+    //
+    // 另注：不能用 `Frame::show` 包标题条——`Frame::begin` 会把整个面板高度作为
+    // content_ui 的 max_rect，垂直居中的 `selectable_label` 把 min_rect 撑满整高，
+    // `Frame::end` 把父 ui cursor 推到面板底部 → 正文高度归零（M18 的坑）。
     let mut closed = false;
     let mut close_file = false;
-    // 标题条要薄：全局 spacing 里按钮最小高 22px、上下 padding 3px，而 `ui.horizontal` 的行高
-    // 直接取 `interact_size.y`（22px），加上 padding 让标题条高达 26px，12px 文字上下各留约 5px
-    // 空白。用 `scope` 隔离：在子 ui 里收紧三档（不影响正文），让标题条贴近编辑器组观感（~20px）。
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
-        ui.spacing_mut().interact_size.y = 16.0;
-        ui.spacing_mut().button_padding.y = 0.0;
-        ui.horizontal(|ui| {
-            let title = pane_title(state, pane_id);
-            // 点击标题条（非按钮区）激活该面板。
-            let label = ui.selectable_label(is_active, title);
-            if label.clicked() && !is_active {
-                state.active_pane = pane_id;
-                state.sync_active_pane_mirror();
-            }
-            // 标题条右侧图标区（right_to_left：最右为关闭，往左依次拆分、单独打开/返回共享）。
-            // 全部图标化、扁平无边框，对齐 VS Code 编辑器组的 action icon 观感。
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 关闭按钮始终显示：多面板=关闭该面板，单面板=关闭当前文件（回到空面板）。
-                if titlebar_char_icon(
-                    ui,
-                    "×",
-                    if state.pane_layout.count > 1 {
-                        "关闭面板"
-                    } else {
-                        "关闭文件"
-                    },
-                    true,
-                )
-                .clicked()
-                {
-                    if state.pane_layout.count > 1 {
-                        closed = true;
-                    } else {
-                        close_file = true;
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), TITLE_BAR_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            // ① 背景：活动面板用高亮色，非活动用面板底色。**必须在内容之前绘制**。
+            ui.painter().rect_filled(
+                ui.max_rect(),
+                0.0,
+                if is_active { p.row_active } else { p.panel },
+            );
+            // ② 内容：收紧 spacing 让标题条保持纤薄（不影响正文）。
+            // 全局 spacing 里按钮最小高 22px、上下 padding 3px，而 `ui.horizontal` 的行高
+            // 直接取 `interact_size.y`（22px），加上 padding 让标题条高达 26px；
+            // 用 `scope` 隔离收紧三档，贴近编辑器组观感。
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
+                ui.spacing_mut().interact_size.y = 16.0;
+                ui.spacing_mut().button_padding.y = 0.0;
+                ui.horizontal(|ui| {
+                    let title = pane_title(state, pane_id);
+                    // 点击标题条（非按钮区）激活该面板。
+                    let label = ui.selectable_label(is_active, title);
+                    if label.clicked() && !is_active {
+                        state.active_pane = pane_id;
+                        state.sync_active_pane_mirror();
                     }
-                }
+                    // 标题条右侧图标区（right_to_left：最右为关闭，往左依次拆分、单独打开/返回共享）。
+                    // 全部图标化、扁平无边框，对齐 VS Code 编辑器组的 action icon 观感。
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 关闭按钮始终显示：多面板=关闭该面板，单面板=关闭当前文件（回到空面板）。
+                        if titlebar_char_icon(
+                            ui,
+                            "×",
+                            if state.pane_layout.count > 1 {
+                                "关闭面板"
+                            } else {
+                                "关闭文件"
+                            },
+                            true,
+                        )
+                        .clicked()
+                        {
+                            if state.pane_layout.count > 1 {
+                                closed = true;
+                            } else {
+                                close_file = true;
+                            }
+                        }
 
-                // 拆分：向右拆分出一个新面板（VS Code 默认 split 方向），达到上限则禁用。
-                let can_split = state.pane_layout.count < MAX_PANES;
-                if titlebar_split_icon(
-                    ui,
-                    if can_split {
-                        "向右拆分出新面板"
-                    } else {
-                        "已达到面板数量上限"
-                    },
-                    can_split,
-                )
-                .clicked()
-                {
-                    state.split_pane(SplitDir::Horizontal);
-                    state.save_prefs();
-                }
+                        // 拆分：向右拆分出一个新面板（VS Code 默认 split 方向），达到上限则禁用。
+                        let can_split = state.pane_layout.count < MAX_PANES;
+                        if titlebar_split_icon(
+                            ui,
+                            if can_split {
+                                "向右拆分出新面板"
+                            } else {
+                                "已达到面板数量上限"
+                            },
+                            can_split,
+                        )
+                        .clicked()
+                        {
+                            state.split_pane(SplitDir::Horizontal);
+                            state.save_prefs();
+                        }
 
-                // 该面板已单独打开文件 → 提供「返回共享」；否则提供「本面板打开」单独载入文件。
-                if state.panes[pane_id].fileset_override.is_some() {
-                    if titlebar_back_icon(ui, "改回共享全局文件集", true).clicked() {
-                        state.panes[pane_id].fileset_override = None;
-                        state.panes[pane_id].selected_row = None;
-                        state.panes[pane_id].scroll_target = None;
-                        state.panes[pane_id].max_line_width = 0.0; // 惰性重算
-                    }
-                } else if titlebar_char_icon(
-                    ui,
-                    "＋",
-                    "在本面板单独打开一个日志文件（与全局文件集脱钩）",
-                    true,
-                )
-                .clicked()
-                {
-                    state.pending_open_in_pane = Some(pane_id);
-                }
+                        // 该面板已单独打开文件 → 提供「返回共享」；否则提供「本面板打开」单独载入文件。
+                        if state.panes[pane_id].fileset_override.is_some() {
+                            if titlebar_back_icon(ui, "改回共享全局文件集", true).clicked()
+                            {
+                                state.panes[pane_id].fileset_override = None;
+                                state.panes[pane_id].selected_row = None;
+                                state.panes[pane_id].scroll_target = None;
+                                state.panes[pane_id].max_line_width = 0.0; // 惰性重算
+                            }
+                        } else if titlebar_char_icon(
+                            ui,
+                            "＋",
+                            "在本面板单独打开一个日志文件（与全局文件集脱钩）",
+                            true,
+                        )
+                        .clicked()
+                        {
+                            state.pending_open_in_pane = Some(pane_id);
+                        }
+                    });
+                });
             });
-        });
-    });
-    // 标题条背景：活动面板用高亮色，非活动用面板底色。
-    let title_rect = egui::Rect::from_min_max(
-        egui::pos2(ui.max_rect().left(), title_top),
-        egui::pos2(ui.max_rect().right(), ui.cursor().min.y),
-    );
-    ui.painter().rect_filled(
-        title_rect,
-        0.0,
-        if is_active { p.row_active } else { p.panel },
+        },
     );
 
     // —— 正文：编辑器风格日志区 ——
