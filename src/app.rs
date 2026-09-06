@@ -340,6 +340,27 @@ impl AppState {
         self.sync_active_pane_mirror();
     }
 
+    /// 关闭「当前打开的文件」，回到空面板初始态（单面板时点 ✕ 触发）。
+    ///
+    /// 与「打开文件整体替换」的清理清单一致：清空全局文件集、检索态、每面板视图态、
+    /// 顶层镜像与脏标记，状态栏提示「未打开文件」。多面板时不走此方法（点 ✕ = 关闭面板）。
+    pub fn close_current_file(&mut self) {
+        self.fileset.clear();
+        self.search_results.clear();
+        self.search_truncated = false;
+        self.search_error = None;
+        self.hit_regex = None;
+        // 视图态是每面板独立持有的，必须遍历清空（含各面板单独打开的文件集）。
+        self.clear_pane_view_states();
+        self.selected_row = None;
+        self.sidebar_active_file = None;
+        self.dirty_files.clear();
+        self.max_line_width = 0.0;
+        self.in_result_mode = false;
+        self.status_text = "未打开文件".to_owned();
+        self.sync_active_pane_mirror();
+    }
+
     /// 把活动面板的 `wrap`/`selected_row`/`max_line_width`/`in_result_mode` 同步到 `AppState`
     /// 顶层镜像字段（工具栏、状态栏、快捷键读的是这些镜像，避免它们关心面板下标）。
     pub fn sync_active_pane_mirror(&mut self) {
@@ -1660,38 +1681,59 @@ fn render_one_pane(ui: &mut egui::Ui, state: &mut AppState, pane_id: usize) -> O
     // 这里用 `horizontal` 手动布局，标题条只占自然高度，正文再取剩余矩形。
     let title_top = ui.cursor().min.y;
     let mut closed = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        let title = pane_title(state, pane_id);
-        // 点击标题条（非按钮区）激活该面板。
-        let label = ui.selectable_label(is_active, title);
-        if label.clicked() && !is_active {
-            state.active_pane = pane_id;
-            state.sync_active_pane_mirror();
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // 该面板已单独打开文件 → 提供「返回共享」；否则提供「本面板打开」单独载入一个文件。
-            if state.panes[pane_id].fileset_override.is_some() {
-                if ui
-                    .small_button("共享")
-                    .on_hover_text("改回共享全局文件集")
+    let mut close_file = false;
+    // 标题条要薄：全局 spacing 里按钮最小高 22px、上下 padding 3px，而 `ui.horizontal` 的行高
+    // 直接取 `interact_size.y`（22px），加上 padding 让标题条高达 26px，12px 文字上下各留约 5px
+    // 空白。用 `scope` 隔离：在子 ui 里收紧三档（不影响正文），让标题条贴近编辑器组观感（~20px）。
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
+        ui.spacing_mut().interact_size.y = 16.0;
+        ui.spacing_mut().button_padding.y = 0.0;
+        ui.horizontal(|ui| {
+            let title = pane_title(state, pane_id);
+            // 点击标题条（非按钮区）激活该面板。
+            let label = ui.selectable_label(is_active, title);
+            if label.clicked() && !is_active {
+                state.active_pane = pane_id;
+                state.sync_active_pane_mirror();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 该面板已单独打开文件 → 提供「返回共享」；否则提供「本面板打开」单独载入一个文件。
+                if state.panes[pane_id].fileset_override.is_some() {
+                    if ui
+                        .small_button("共享")
+                        .on_hover_text("改回共享全局文件集")
+                        .clicked()
+                    {
+                        state.panes[pane_id].fileset_override = None;
+                        state.panes[pane_id].selected_row = None;
+                        state.panes[pane_id].scroll_target = None;
+                        state.panes[pane_id].max_line_width = 0.0; // 惰性重算
+                    }
+                } else if ui
+                    .small_button("本面板")
+                    .on_hover_text("在本面板单独打开一个日志文件（与全局文件集脱钩）")
                     .clicked()
                 {
-                    state.panes[pane_id].fileset_override = None;
-                    state.panes[pane_id].selected_row = None;
-                    state.panes[pane_id].scroll_target = None;
-                    state.panes[pane_id].max_line_width = 0.0; // 惰性重算
+                    state.pending_open_in_pane = Some(pane_id);
                 }
-            } else if ui
-                .small_button("本面板")
-                .on_hover_text("在本面板单独打开一个日志文件（与全局文件集脱钩）")
-                .clicked()
-            {
-                state.pending_open_in_pane = Some(pane_id);
-            }
-            if state.pane_layout.count > 1 && ui.small_button("✕").clicked() {
-                closed = true;
-            }
+                // 关闭按钮始终显示：多面板=关闭该面板，单面板=关闭当前文件（回到空面板）。
+                if ui
+                    .small_button("✕")
+                    .on_hover_text(if state.pane_layout.count > 1 {
+                        "关闭面板"
+                    } else {
+                        "关闭文件"
+                    })
+                    .clicked()
+                {
+                    if state.pane_layout.count > 1 {
+                        closed = true;
+                    } else {
+                        close_file = true;
+                    }
+                }
+            });
         });
     });
     // 标题条背景：活动面板用高亮色，非活动用面板底色。
@@ -1735,6 +1777,11 @@ fn render_one_pane(ui: &mut egui::Ui, state: &mut AppState, pane_id: usize) -> O
             state.active_pane = pane_id;
             state.sync_active_pane_mirror();
         }
+    }
+
+    // 单面板点 ✕：关闭当前文件，回到空面板（本帧直接生效，返回 None 不关面板）。
+    if close_file {
+        state.close_current_file();
     }
 
     if closed { Some(pane_id) } else { None }
@@ -1898,6 +1945,44 @@ mod tests {
         s.close_pane(0);
         assert_eq!(s.panes.len(), 1); // 仍保留一个
         assert_eq!(s.pane_layout.count, 1);
+    }
+
+    #[test]
+    fn close_current_file_clears_fileset_and_view_state() {
+        let mut s = ready_state();
+        let p = tmp_log("close_current.log");
+        let idx = crate::core::indexer::LogFileIndex::open(&p).unwrap();
+        s.fileset.push(std::sync::Arc::new(idx));
+        assert_eq!(s.fileset.file_count(), 1);
+
+        // 制造脏状态：选中行 / 侧边栏高亮 / 横向宽度 / 命中视图 / 状态文本。
+        s.selected_row = Some(0);
+        s.sidebar_active_file = Some(0);
+        s.max_line_width = 123.0;
+        s.in_result_mode = true;
+        s.status_text = "已加载".to_owned();
+
+        s.close_current_file();
+
+        assert_eq!(s.fileset.file_count(), 0);
+        assert_eq!(s.selected_row, None);
+        assert_eq!(s.sidebar_active_file, None);
+        assert_eq!(s.max_line_width, 0.0);
+        assert!(!s.in_result_mode);
+        assert_eq!(s.status_text, "未打开文件");
+    }
+
+    #[test]
+    fn close_current_file_drops_pane_override() {
+        let mut s = ready_state();
+        s.split_pane(SplitDir::Horizontal);
+        let p = tmp_log("override.log");
+        s.open_paths_to_active_pane(vec![p.clone()]);
+        assert!(s.panes[1].fileset_override.is_some());
+
+        s.close_current_file();
+        assert!(s.panes[1].fileset_override.is_none());
+        assert_eq!(s.fileset.file_count(), 0);
     }
 
     #[test]
