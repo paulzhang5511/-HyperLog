@@ -15,8 +15,11 @@ use crate::ui::theme::{self, Palette};
 
 /// 单行高度（像素）。固定行高是虚拟滚动 O(1) 定位的前提（spec §7.2）。
 ///
+/// 该值是 `theme::LOG_FONT_SIZE`（12.5px 基准字号）下的行高，与字号之比即行距倍率
+/// （18/12.5≈1.44）。用户反馈行间距偏大，压缩到 15/12.5=1.2 倍，正文更紧凑。
+///
 /// 注意：`ScrollArea::show_rows` 还会把 `spacing.item_spacing.y` 累加到实际行距上。
-pub const ROW_HEIGHT: f32 = 18.0;
+pub const ROW_HEIGHT: f32 = 15.0;
 /// 行号槽左右内边距。
 const GUTTER_PAD: f32 = 8.0;
 /// 行号槽与正文之间的留白。
@@ -114,7 +117,7 @@ pub fn show(
     // 保证放大后行高、行号槽宽度同步增长，否则文字会挤在一起或被裁切。
     let font_size = state.font_size;
     let gutter_size = font_size * (theme::GUTTER_FONT_SIZE / theme::LOG_FONT_SIZE);
-    // 默认字号下行高 18px（12.5px 字 → 1.44 倍行距），缩放时保持同一比例。
+    // 默认字号下行高 15px（12.5px 字 → 1.2 倍行距），缩放时保持同一比例。
     let row_unit = font_size * (ROW_HEIGHT / theme::LOG_FONT_SIZE);
 
     let total = if in_result {

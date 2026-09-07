@@ -12,10 +12,12 @@ use std::path::{Path, PathBuf};
 ///
 /// 定义在 core 层（而非 `ui::theme`）是因为偏好要能独立持久化/解析，core 禁止依赖 GUI；
 /// `ui::theme::LOG_FONT_SIZE` 与之保持一致，仅作为 GUI 层的回退常量。
-pub const DEFAULT_FONT_SIZE: f32 = 12.5;
-/// 缩放下限。8.0 太小（正文几乎不可读），曾因长按 ⌘- 缩到底导致「文字特别小」的反馈，
-/// 故提到 9.0：既保留缩放余量，又保证最小字号仍清晰可读。
-pub const MIN_FONT_SIZE: f32 = 9.0;
+/// 日志正文默认字号。原 12.5，因换用衬线字体 NotoSerifSC 后同字号视觉偏小（衬线笔画细），
+/// 用户反馈「字体还是很小」，最终定稿 18.0：日志正文明显放大，观感清晰。
+pub const DEFAULT_FONT_SIZE: f32 = 18.0;
+/// 缩放下限。曾因长按 ⌘- 缩到底导致「文字特别小」的反馈，且衬线字体下小字号更显瘦弱，
+/// 故下限抬到 12.0：既保留缩放余量，又保证最小字号仍清晰可读。
+pub const MIN_FONT_SIZE: f32 = 12.0;
 pub const MAX_FONT_SIZE: f32 = 28.0;
 
 /// 主题偏好。与 `egui::Theme` 解耦，在 GUI 层映射。

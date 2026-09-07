@@ -2450,7 +2450,7 @@ mod tests {
     #[test]
     fn reset_font_size_returns_to_default() {
         let mut s = ready_state();
-        s.set_font_size(18.0);
+        s.set_font_size(24.0);
         assert_ne!(s.font_size, crate::core::prefs::DEFAULT_FONT_SIZE);
         s.reset_font_size();
         assert_eq!(s.font_size, crate::core::prefs::DEFAULT_FONT_SIZE);
@@ -2458,14 +2458,14 @@ mod tests {
 
     #[test]
     fn min_font_size_is_still_readable() {
-        // 缩放下限曾为 8.0，长按 ⌘- 缩到底后正文几乎不可读；下限必须 ≥ 9.0 保证最小字号清晰。
-        // 直接断言常量会触发 `clippy::assertions_on_constants`，故通过行为验证：
-        // 从默认字号连续缩到不能再缩，最终值即 MIN，断言其仍 ≥ 9.0。
+        // 缩放下限曾为 8.0，长按 ⌘- 缩到底后正文几乎不可读；衬线字体下小字号更显瘦弱，
+        // 下限随默认字号抬到 12.0。直接断言常量会触发 `clippy::assertions_on_constants`，
+        // 故通过行为验证：从默认字号连续缩到不能再缩，最终值即 MIN，断言其仍 ≥ 12.0。
         let mut s = ready_state();
         for _ in 0..100 {
             s.zoom_font(-1.0);
         }
-        assert!(s.font_size >= 9.0);
+        assert!(s.font_size >= 12.0);
         assert_eq!(s.font_size, crate::core::prefs::MIN_FONT_SIZE);
     }
 
