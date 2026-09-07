@@ -207,7 +207,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 };
                 ui.weak(label);
                 // 命中导航按钮（等价 F3 / ⇧F3）。图标用中文单字而非 Unicode 箭头：
-                // egui 字体链对几何/箭头符号覆盖不可靠，中文由内嵌 MiSans 确定覆盖。
+                // egui 字体链对几何/箭头符号覆盖不可靠，中文由内嵌 NotoSerifSC 确定覆盖。
                 if hits > 0 {
                     if ui
                         .small_button("上")

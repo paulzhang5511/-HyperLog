@@ -735,9 +735,13 @@ pub fn estimate_content_width(fileset: &crate::core::indexer::FileSet, font_size
 ///
 /// 基准常量是 `theme::LOG_FONT_SIZE`（12.5px）下的实测字宽，故按当前字号等比缩放——
 /// 否则 `⌘+` 放大后估算值偏小，横向滚动条会滚不到行尾。
+///
+/// 常量随 Monospace 主字体（SauceCodePro Nerd Font）与中文兜底（NotoSerifSC）校准：
+/// SauceCodePro 拉丁 advance = 0.6em → 12.5px 下 7.5px；NotoSerifSC 中文 advance = 1.0em
+/// → 12.5px 下 12.5px（满宽）。旧值 7.2/12.2 是 Hack + MiSans 的实测值。
 fn estimate_text_width(line: &str, font_size: f32) -> f32 {
-    const ASCII_W: f32 = 7.2; // 12.5px 等宽拉丁字符的实测字宽
-    const WIDE_W: f32 = 12.2; // CJK 等全角字符约为一个 em
+    const ASCII_W: f32 = 7.5; // 12.5px 等宽拉丁字符字宽（SauceCodePro 0.6em）
+    const WIDE_W: f32 = 12.5; // CJK 全角字符满宽（NotoSerifSC 1.0em）
     let scale = font_size / theme::LOG_FONT_SIZE;
     let mut w = 0.0_f32;
     for c in line.chars() {

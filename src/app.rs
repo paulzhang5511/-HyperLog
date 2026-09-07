@@ -661,17 +661,31 @@ pub struct LogViewerApp {
 }
 
 /// CJK 兜底字体在 `FontDefinitions::font_data` 中的键名。
-const FONT_CJK: &str = "MiSans";
+///
+/// 原为 MiSans（黑体），后 assets/fonts 目录更新为 NotoSerifSC（思源宋体）系列，
+/// 故改用其 Regular 字重做中文兜底。它是**衬线**字体，作为日志正文的 CJK 兜底
+/// 观感稍偏「印刷感」，但目录内暂无黑体可替代，用字重最全的 Regular 保证覆盖。
+const FONT_CJK: &str = "NotoSerifSC";
 
-/// 配置中文字体。
+/// 等宽主字体在 `FontDefinitions::font_data` 中的键名。
+///
+/// SauceCodePro Nerd Font 是等宽代码字体，且内嵌 Nerd Font 图标字形（如箭头、
+/// 几何符号），用它替换 egui 内置 Hack 作 Monospace 族**主字体**，日志正文的
+/// 代码/符号显示更佳，也顺带覆盖了此前「几何/箭头符号字形覆盖不可靠」需自绘
+/// 矢量规避的痛点。
+const FONT_MONO: &str = "SauceCodeProNerdFont";
+
+/// 配置中文字体与等宽字体。
 ///
 /// egui 内置字体（Hack / Ubuntu-Light / NotoEmoji）**均不含 CJK 字形**，
 /// 未额外配置时界面与日志中的中文会渲染成空白方块（豆腐块）。
 ///
-/// 这里把 MiSans 作为**兜底字体追加**到 Proportional / Monospace 两个字体族末尾，
-/// 而不是替换主字体：
-/// - 拉丁字符仍由内置字体绘制，Monospace 保持等宽，日志列对齐不受影响；
-/// - 仅当内置字体缺字形时（中文等 CJK 字符）才回退到 MiSans。
+/// 配置策略：
+/// - **Monospace 族**：把 SauceCodePro Nerd Font 前置为主字体（`push` 到末尾会让它被
+///   内置 Hack 抢先，故需 `insert(0)` 放到最前），拉丁/代码/符号走它，等宽对齐保持；
+///   再追加 NotoSerifSC 兜底中文，内置 Hack/NotoEmoji 仍留在族内做最后回退。
+/// - **Proportional 族**：不动内置主字体（Ubuntu-Light），仅把 NotoSerifSC 追加到末尾
+///   做中文兜底，拉丁仍由内置字体绘制、界面观感不变。
 ///
 /// 字体经 `include_bytes!` 编译进二进制，打包为 `.app` 后无需附带资源目录。
 fn setup_fonts(ctx: &egui::Context) {
@@ -679,16 +693,35 @@ fn setup_fonts(ctx: &egui::Context) {
     fonts.font_data.insert(
         FONT_CJK.to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/fonts/MiSans-Normal.ttf"
+            "../assets/fonts/NotoSerifSC-Regular.ttf"
         ))),
     );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push(FONT_CJK.to_owned());
-    }
+    fonts.font_data.insert(
+        FONT_MONO.to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/SauceCodeProNerdFont-Regular.ttf"
+        ))),
+    );
+
+    // Monospace：SauceCodePro 主字体（最前）+ 中文兜底 + 内置回退。
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, FONT_MONO.to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push(FONT_CJK.to_owned());
+
+    // Proportional：内置主字体不变，仅追加中文兜底。
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .push(FONT_CJK.to_owned());
+
     ctx.set_fonts(fonts);
 }
 
@@ -1968,8 +2001,7 @@ fn titlebar_char_icon(ui: &mut egui::Ui, ch: &str, tip: &str, enabled: bool) -> 
 }
 
 /// 标题条「返回共享」图标：自绘左箭头。不用 U+21A9（`↩`，Arrows 区）——
-/// egui 内置字体链（Ubuntu-Light/NotoEmoji/MiSans）对该字符字形覆盖不可靠，
-/// 可能渲染成豆腐块；自绘矢量则与拆分图标风格统一且确定性渲染。
+/// 自绘矢量与拆分图标风格统一且确定性渲染（虽有 Nerd Font 兜底，仍保持自绘以稳字宽）。
 fn titlebar_back_icon(ui: &mut egui::Ui, tip: &str, enabled: bool) -> egui::Response {
     titlebar_icon(ui, tip, enabled, |painter, rect, color| {
         let r = rect.shrink(4.0);

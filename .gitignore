@@ -17,3 +17,9 @@
 *.log.tmp
 
 .DS_Store
+
+# 字体：只提交实际嵌入的字重（NotoSerifSC-Regular + SauceCodeProNerdFont-Regular），
+# 其余字重变体（Bold/Black/Italic 等）体积大且当前未用，本地保留但入库。
+/assets/fonts/*.ttf
+!/assets/fonts/NotoSerifSC-Regular.ttf
+!/assets/fonts/SauceCodeProNerdFont-Regular.ttf
