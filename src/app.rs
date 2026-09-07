@@ -672,8 +672,10 @@ pub struct LogViewerApp {
 
 /// CJK 兜底字体在 `FontDefinitions::font_data` 中的键名。
 ///
-/// assets/fonts 提供 NotoSerifSC（思源宋体）8 个字重与 SauceCodePro Nerd Font
-/// （等宽代码体）12 个变体。字重选择的核心约束是**与拉丁主字体的字重相称**：
+/// assets/fonts 仅保留 3 个实际嵌入的字体文件（其余未使用字重已移除）：
+/// `NotoSerifSC-Medium`(中文兜底) / `SauceCodeProNerdFont-Regular`(等宽主字体) /
+/// `SauceCodeProNerdFont-Bold`(命中加粗独立族)。字重选择的核心约束是
+/// **与拉丁主字体的字重相称**：
 /// 日志正文拉丁部分固定走 `SauceCodeProNerdFont-Regular`(400)，若中文用
 /// `Black`(900) 会出现「英文细、中文极粗」的割裂感（`Regular`(400) 又因衬线
 /// 笔画纤细在同字号下显小）。取 **`Medium`(500)**：比 Regular 粗一档，暗色主题下
