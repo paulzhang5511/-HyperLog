@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 /// 定义在 core 层（而非 `ui::theme`）是因为偏好要能独立持久化/解析，core 禁止依赖 GUI；
 /// `ui::theme::LOG_FONT_SIZE` 与之保持一致，仅作为 GUI 层的回退常量。
 pub const DEFAULT_FONT_SIZE: f32 = 12.5;
-pub const MIN_FONT_SIZE: f32 = 8.0;
+/// 缩放下限。8.0 太小（正文几乎不可读），曾因长按 ⌘- 缩到底导致「文字特别小」的反馈，
+/// 故提到 9.0：既保留缩放余量，又保证最小字号仍清晰可读。
+pub const MIN_FONT_SIZE: f32 = 9.0;
 pub const MAX_FONT_SIZE: f32 = 28.0;
 
 /// 主题偏好。与 `egui::Theme` 解耦，在 GUI 层映射。

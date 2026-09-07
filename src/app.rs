@@ -787,6 +787,30 @@ impl LogViewerApp {
         let pressed = |ctx: &egui::Context, m: egui::Modifiers, k: egui::Key| {
             ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(m, k)))
         };
+        // 字号缩放专用：忽略 key-repeat。`consume_shortcut`（→`count_and_consume_key`）对
+        // repeat 事件同样返回 true（其 `matches!` 用 `pressed: true, ..` 吞掉了 `repeat` 字段），
+        // 长按 ⌘- 一秒就会把字号从 12.5 一路跌到下限 8.0 并落盘，表现为「文字突然变得特别小」。
+        // 这里改为只消费「非 repeat」的按下事件，长按仅缩放一次，需多次短按才能持续缩放。
+        let zoom_pressed = |ctx: &egui::Context, m: egui::Modifiers, k: egui::Key| {
+            let mut matched = false;
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    let is_match = matches!(
+                        e,
+                        egui::Event::Key {
+                            key,
+                            modifiers,
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        } if *key == k && modifiers.matches_logically(m)
+                    );
+                    matched |= is_match;
+                    !is_match
+                });
+            });
+            matched
+        };
 
         if pressed(ctx, cmd, egui::Key::O) {
             self.state.pending_open = true;
@@ -840,13 +864,14 @@ impl LogViewerApp {
                 .goto_hit(if prev { HitDir::Prev } else { HitDir::Next });
         }
         // ⌘+ / ⌘- / ⌘0：正文字号缩放（VS Code 同款），改动即落盘。
-        if pressed(ctx, cmd, egui::Key::Plus) {
+        // 用 `zoom_pressed`（忽略 key-repeat）而非 `pressed`，避免长按瞬间缩到极值。
+        if zoom_pressed(ctx, cmd, egui::Key::Plus) {
             self.state.zoom_font(1.0);
         }
-        if pressed(ctx, cmd, egui::Key::Minus) {
+        if zoom_pressed(ctx, cmd, egui::Key::Minus) {
             self.state.zoom_font(-1.0);
         }
-        if pressed(ctx, cmd, egui::Key::Num0) {
+        if zoom_pressed(ctx, cmd, egui::Key::Num0) {
             self.state.reset_font_size();
         }
         // Esc：退出**活动面板**的命中视图（返回全量日志）；否则清除活动面板选中行。
@@ -2397,6 +2422,19 @@ mod tests {
         assert_ne!(s.font_size, crate::core::prefs::DEFAULT_FONT_SIZE);
         s.reset_font_size();
         assert_eq!(s.font_size, crate::core::prefs::DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn min_font_size_is_still_readable() {
+        // 缩放下限曾为 8.0，长按 ⌘- 缩到底后正文几乎不可读；下限必须 ≥ 9.0 保证最小字号清晰。
+        // 直接断言常量会触发 `clippy::assertions_on_constants`，故通过行为验证：
+        // 从默认字号连续缩到不能再缩，最终值即 MIN，断言其仍 ≥ 9.0。
+        let mut s = ready_state();
+        for _ in 0..100 {
+            s.zoom_font(-1.0);
+        }
+        assert!(s.font_size >= 9.0);
+        assert_eq!(s.font_size, crate::core::prefs::MIN_FONT_SIZE);
     }
 
     #[test]
