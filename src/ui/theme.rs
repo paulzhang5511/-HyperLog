@@ -34,9 +34,13 @@ pub struct Palette {
     pub gutter: Color32,
     /// 行号槽与正文之间的分隔线。
     pub gutter_line: Color32,
-    /// 指针所在行背景。
+    /// 指针所在行背景：刻意低调，仅作「可点击」的轻提示。
     pub row_hover: Color32,
     /// 选中行背景。
+    ///
+    /// 必须与 `row_hover` **拉开明显差距**：两者曾仅差一档灰（暗色 0x282B2C vs
+    /// 0x33383D），选中后肉眼几乎分辨不出「哪几行被选中」，多行选择时尤甚。
+    /// 故选中行改为更亮、且带蓝调（与 accent 呼应），一眼可辨。
     pub row_active: Color32,
     /// 控件描边与分隔线。
     pub border: Color32,
@@ -79,7 +83,9 @@ pub const DARK: Palette = Palette {
     gutter: Color32::from_rgb(0x1B, 0x1B, 0x1B),
     gutter_line: Color32::from_rgb(0x2E, 0x2E, 0x2E),
     row_hover: Color32::from_rgb(0x28, 0x2B, 0x2C),
-    row_active: Color32::from_rgb(0x33, 0x38, 0x3D),
+    // 选中行：明显亮于 hover 且带蓝调（accent 方向的偏移），与 hover 拉开可辨差距。
+    // 亮度仍受 `log_text_colors_stay_readable` 约束——语义色在其上须 ≥3.0:1、正文 ≥4.5:1。
+    row_active: Color32::from_rgb(0x3D, 0x4A, 0x5C),
     border: Color32::from_rgb(0x3C, 0x3C, 0x3C),
     control_hover: Color32::from_rgb(0x3F, 0x43, 0x47),
     text: Color32::from_rgb(0xD4, 0xD4, 0xD4),
@@ -110,7 +116,8 @@ pub const LIGHT: Palette = Palette {
     gutter: Color32::from_rgb(0xFA, 0xFA, 0xFA),
     gutter_line: Color32::from_rgb(0xE5, 0xE5, 0xE5),
     row_hover: Color32::from_rgb(0xEC, 0xEC, 0xEC),
-    row_active: Color32::from_rgb(0xDA, 0xDE, 0xE4),
+    // 选中行：明显深于 hover 且带蓝调，与 hover 拉开可辨差距（同暗色主题的对称处理）。
+    row_active: Color32::from_rgb(0xC2, 0xD3, 0xE8),
     border: Color32::from_rgb(0xCE, 0xCE, 0xCE),
     control_hover: Color32::from_rgb(0xE8, 0xE8, 0xE8),
     text: Color32::from_rgb(0x33, 0x33, 0x33),

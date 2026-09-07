@@ -18,8 +18,9 @@
 
 .DS_Store
 
-# 字体：只提交实际嵌入的字重（NotoSerifSC-Regular + SauceCodeProNerdFont-Regular），
-# 其余字重变体（Bold/Black/Italic 等）体积大且当前未用，本地保留但入库。
+# 字体：只提交实际嵌入的字重（NotoSerifSC-Black + SauceCodeProNerdFont-Regular），
+# 其余字重变体（Regular/Bold/Italic 等）体积大且当前未用，本地保留但不入库。
+# 注意：负向 `!` 能生效的前提是父目录 /assets/fonts/ 本身未被忽略。
 /assets/fonts/*.ttf
-!/assets/fonts/NotoSerifSC-Regular.ttf
+!/assets/fonts/NotoSerifSC-Black.ttf
 !/assets/fonts/SauceCodeProNerdFont-Regular.ttf

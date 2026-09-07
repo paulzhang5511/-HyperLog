@@ -20,10 +20,27 @@ use crate::ui::theme::{self, Palette};
 ///
 /// 注意：`ScrollArea::show_rows` 还会把 `spacing.item_spacing.y` 累加到实际行距上。
 pub const ROW_HEIGHT: f32 = 15.0;
-/// 行号槽左右内边距。
+/// 行号槽左右内边距（**基准值**，按当前字号等比缩放，见 `gutter_pad_for`）。
+///
+/// 曾为固定 8px：正文字号放大到 18 后，行号与槽边缘、正文与行号槽的留白相对
+/// 变窄，观感发挤。改随字号缩放后，任意字号下的留白比例一致。
 const GUTTER_PAD: f32 = 8.0;
-/// 行号槽与正文之间的留白。
+/// 行号槽与正文之间的留白（同为基准值，按字号缩放，见 `text_pad_for`）。
 const TEXT_PAD: f32 = 8.0;
+/// 光标行左侧指示条宽度（VS Code 当前行指示条）。字号放大后 2px 过细，取 3px。
+const CURSOR_BAR_W: f32 = 3.0;
+
+/// 行号槽内边距按字号等比缩放：`LOG_FONT_SIZE` 下即 `GUTTER_PAD`。
+#[inline]
+fn gutter_pad_for(font_size: f32) -> f32 {
+    GUTTER_PAD * (font_size / theme::LOG_FONT_SIZE)
+}
+
+/// 正文与行号槽之间的留白按字号等比缩放。
+#[inline]
+fn text_pad_for(font_size: f32) -> f32 {
+    TEXT_PAD * (font_size / theme::LOG_FONT_SIZE)
+}
 /// 单个行号字符的估算宽度（11 px 等宽字体约 6.6 px）。
 const GUTTER_CHAR_W: f32 = 6.8;
 /// 单行渲染字符上限（spec Q10 / A9）：超出则截断，避免 egui 对超长行做字形布局而卡死。
@@ -155,8 +172,10 @@ pub fn show(
         digits_of(total)
     };
     let gutter_char_w = GUTTER_CHAR_W * (gutter_size / theme::GUTTER_FONT_SIZE);
-    let gutter_w = digits as f32 * gutter_char_w + GUTTER_PAD * 2.0;
-    let avail_text_w = (ui.available_width() - gutter_w - TEXT_PAD * 2.0).max(120.0);
+    // 内边距随字号缩放，与 `paint_row_bg` 内的推导保持一致（二者等价）。
+    let gutter_w = digits as f32 * gutter_char_w + gutter_pad_for(font_size) * 2.0;
+    let text_pad = text_pad_for(font_size);
+    let avail_text_w = (ui.available_width() - gutter_w - text_pad * 2.0).max(120.0);
 
     // 横向滚动范围按「估算的最长行」固定：若跟随当前可见行，滚动条长度会随滚动抖动。
     // 首次（max_line_width==0）惰性估算，避免每帧扫描；`load_paths`/`reload` 清零各面板时也会重算。
@@ -211,7 +230,7 @@ pub fn show(
                     // 行矩形宽度固定（含行号槽与正文留白），使横向滚动范围稳定
                     let row_rect = egui::Rect::from_min_size(
                         ui.cursor().min,
-                        egui::vec2(gutter_w + TEXT_PAD + text_w, row_h),
+                        egui::vec2(gutter_w + text_pad + text_w, row_h),
                     );
 
                     // 1) 行背景与行号：先画，位于文本之下
@@ -251,7 +270,7 @@ pub fn show(
                     }
 
                     // 3) 正文：一个 Label 承载整行的多色分段
-                    ui.add_space(TEXT_PAD);
+                    ui.add_space(text_pad);
                     let text_resp = ui
                         .allocate_ui_with_layout(
                             egui::vec2(text_w, row_h),
@@ -278,7 +297,7 @@ pub fn show(
                     if resp.double_clicked()
                         && let Some(pos) = resp.interact_pointer_pos()
                     {
-                        let x_off = pos.x - (row_rect.min.x + gutter_w + TEXT_PAD);
+                        let x_off = pos.x - (row_rect.min.x + gutter_w + text_pad);
                         if let Some(w) = word_at_offset(ui, &text, font_size, x_off) {
                             pane.selected_word = w;
                         }
@@ -548,10 +567,11 @@ fn paint_row_bg(
     } else if ui.rect_contains_pointer(row_rect) {
         ui.painter().rect_filled(row_rect, 0.0, p.row_hover);
     }
-    // 光标行：左侧 accent 竖条（VS Code 当前行指示条，~2px）。必须画在 bg 之上、正文之下。
+    // 光标行：左侧竖条（VS Code 当前行指示条）。必须画在 bg 之上、正文之下。
+    // 3px 而非 2px：正文字号放大后 2px 太细、与行高不成比例，指示作用被削弱。
     if is_cursor {
         ui.painter().rect_filled(
-            egui::Rect::from_min_size(row_rect.min, egui::vec2(2.0, row_rect.height())),
+            egui::Rect::from_min_size(row_rect.min, egui::vec2(CURSOR_BAR_W, row_rect.height())),
             0.0,
             p.accent,
         );
@@ -566,8 +586,13 @@ fn paint_row_bg(
         .vline(x, row_rect.y_range(), egui::Stroke::new(1.0, p.gutter_line));
 
     // 行号：右对齐到行号槽内边距，随行高垂直居中。光标行加亮为 text_strong。
+    // 内边距按字号缩放（固定 8px 在大字号下会显得行号贴边）。
+    // 注意用 `gutter_size` 而非 `font_size` 推导：本函数只接收前者，且二者等价
+    // （`gutter_size = font_size × GUTTER_FONT_SIZE/LOG_FONT_SIZE`，代入后分母约掉），
+    // 这样无需新增参数——本函数已有 7 个参数，再加会触发 clippy `too_many_arguments`。
+    let gutter_pad = GUTTER_PAD * (gutter_size / theme::GUTTER_FONT_SIZE);
     ui.painter().text(
-        egui::pos2(x - GUTTER_PAD, row_rect.center().y),
+        egui::pos2(x - gutter_pad, row_rect.center().y),
         egui::Align2::RIGHT_CENTER,
         gutter_text,
         egui::FontId::monospace(gutter_size),

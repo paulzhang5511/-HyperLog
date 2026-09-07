@@ -662,9 +662,14 @@ pub struct LogViewerApp {
 
 /// CJK 兜底字体在 `FontDefinitions::font_data` 中的键名。
 ///
-/// 原为 MiSans（黑体），后 assets/fonts 目录更新为 NotoSerifSC（思源宋体）系列，
-/// 故改用其 Regular 字重做中文兜底。它是**衬线**字体，作为日志正文的 CJK 兜底
-/// 观感稍偏「印刷感」，但目录内暂无黑体可替代，用字重最全的 Regular 保证覆盖。
+/// 原为 MiSans（黑体），后 assets/fonts 目录更新为 NotoSerifSC（思源宋体）系列。
+/// 经用户确认改用 **Black 字重（900）**：衬线体的 Regular（400）笔画纤细，同字号下
+/// 视觉明显偏小（用户反复反馈「字小」），Black 字重笔画粗壮，中文观感显著更醒目。
+///
+/// 注意命名歧义：**"Black" 是字重（900，超粗），不是"黑体"（无衬线）**——
+/// NotoSerifSC-Black 仍是衬线宋体。它解决「笔画纤细显小」，但衬线与等宽代码体
+/// （SauceCodePro）的风格差异仍在。若日后改为无衬线黑体，只需换本常量的字体文件
+/// 与下方 `include_bytes!` 路径（字宽不受影响：各字重 CJK advance 均为 1.0em）。
 const FONT_CJK: &str = "NotoSerifSC";
 
 /// 等宽主字体在 `FontDefinitions::font_data` 中的键名。
@@ -693,7 +698,7 @@ fn setup_fonts(ctx: &egui::Context) {
     fonts.font_data.insert(
         FONT_CJK.to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/fonts/NotoSerifSC-Regular.ttf"
+            "../assets/fonts/NotoSerifSC-Black.ttf"
         ))),
     );
     fonts.font_data.insert(

@@ -11,7 +11,10 @@ use crate::app::AppState;
 use crate::ui::theme::{self, Palette};
 
 /// 命中行高（结果页同样固定行高以支持虚拟滚动）。
-const ROW_HEIGHT: f32 = 18.0;
+///
+/// 与 `log_view::ROW_HEIGHT` 同义：都是 `LOG_FONT_SIZE`（12.5）基准下的行高，
+/// 与基准字号之比即行距倍率（15/12.5 = 1.2），与日志正文保持一致的紧凑观感。
+const ROW_HEIGHT: f32 = 15.0;
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let p = theme::palette(ui.ctx());
@@ -53,19 +56,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     // —— 命中列表（虚拟滚动）——
     let total = hits.len();
     let mut copied: Option<String> = None;
+    // 字号与行高跟随日志正文（`⌘+`/`⌘-` 的缩放结果），否则结果页固定 12.5px
+    // 而正文已放大到 18px，切换「查找结果」时字号突变、观感割裂。
+    let font_size = state.font_size;
+    let row_h = font_size * (ROW_HEIGHT / theme::LOG_FONT_SIZE);
 
-    egui::ScrollArea::both().auto_shrink([false; 2]).show_rows(
-        ui,
-        ROW_HEIGHT,
-        total,
-        |ui, range| {
+    egui::ScrollArea::both()
+        .auto_shrink([false; 2])
+        .show_rows(ui, row_h, total, |ui, range| {
             for row in range {
                 let hit = &hits[row];
                 let selected = state.grep_selected_row == Some(row);
 
                 let row_rect = egui::Rect::from_min_size(
                     ui.cursor().min,
-                    egui::vec2(ui.available_width(), ROW_HEIGHT),
+                    egui::vec2(ui.available_width(), row_h),
                 );
 
                 // 行背景
@@ -78,7 +83,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 // 单 Label 承载「路径:行号 + 内容」，路径用主题色、行号用 dim
                 let mut job = egui::text::LayoutJob::default();
                 job.wrap.max_width = f32::INFINITY;
-                let mono = egui::FontId::monospace(theme::LOG_FONT_SIZE);
+                let mono = egui::FontId::monospace(font_size);
                 job.append(
                     &format!("{}:{}", hit.display_path, hit.line_number),
                     0.0,
@@ -124,8 +129,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     }
                 });
             }
-        },
-    );
+        });
 
     if let Some(t) = copied {
         ui.ctx().copy_text(t);
