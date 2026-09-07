@@ -2106,7 +2106,7 @@ fn render_one_pane(ui: &mut egui::Ui, state: &mut AppState, pane_id: usize) -> O
     {
         let before = state.panes[pane_id].selected_row;
         let mut pane = state.panes[pane_id].clone();
-        crate::ui::log_view::show(&mut body, &*state, &mut pane, pane_id);
+        let search_word = crate::ui::log_view::show(&mut body, &*state, &mut pane, pane_id);
         // 点击正文行会更新该面板的 selected_row：若发生变化，把此面板设为活动面板，
         // 使跳转 / 复制 / 折行等后续操作作用于它（spec §7.7.7）。
         let row_clicked = pane.selected_row != before;
@@ -2114,6 +2114,11 @@ fn render_one_pane(ui: &mut egui::Ui, state: &mut AppState, pane_id: usize) -> O
         if row_clicked && !is_active {
             state.active_pane = pane_id;
             state.sync_active_pane_mirror();
+        }
+        // 右键「查找选中词」：把词带入检索框并聚焦（不自动跑检索，让用户确认/改词后回车）。
+        if let Some(word) = search_word {
+            state.search_pattern = word;
+            state.focus_search = true;
         }
     }
 

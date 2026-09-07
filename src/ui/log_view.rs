@@ -89,7 +89,15 @@ fn lock_scroll_axis(ui: &mut egui::Ui) {
 /// 导致面板 B 永远收不到（spec §7.7.7）。
 ///
 /// `pane_id` 用于区分各面板的 `ScrollArea` Id，并作为 ⌘C 复制的「活动面板」守卫。
-pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: usize) {
+///
+/// 返回 `Some(word)` 表示用户在右键菜单点了「查找选中词」，由调用方把该词带入检索框
+/// （`state` 在此是不可变借用，无法直接写 `search_pattern`，故用返回值上抛）。
+pub fn show(
+    ui: &mut egui::Ui,
+    state: &AppState,
+    pane: &mut PaneState,
+    pane_id: usize,
+) -> Option<String> {
     // 触控板上下滑动常带轻微水平分量，先锁定主控方向再交给 ScrollArea，
     // 避免正文在上下滚动时左右漂移。
     lock_scroll_axis(ui);
@@ -118,7 +126,7 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
     if total == 0 {
         empty_hint(ui, p);
         pane.selected_row = None;
-        return;
+        return None;
     }
     // 全量 ↔ 命中视图切换后行号语义变化，越界的选中行直接丢弃。
     if pane.selected_row.is_some_and(|r| r >= total) {
@@ -178,6 +186,8 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
 
     let mut clicked: Option<(usize, bool)> = None;
     let mut copied: Option<String> = None;
+    // 右键菜单「查找选中词」上抛的词（不可变借用 `state`，故用返回值传回调用方落实检索）。
+    let mut search_word: Option<String> = None;
     // 行号槽拖动多选：记录本次拖动中指针**悬停**到的那一行（闭包内每帧至多命中一个可见行）。
     let mut drag_hover: Option<usize> = None;
 
@@ -290,6 +300,31 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
                         }
                         if ui.button("复制此行").clicked() {
                             copied = Some(text.to_string());
+                            ui.close();
+                        }
+                        // 带行号复制（`行号: 内容`，VS Code「Copy With Line Numbers」的日志版）：
+                        // 多行选中复制整段带行号，单行只复制当前行带行号。
+                        if ui.button("复制为带行号").clicked() {
+                            let (s, e) = pane.selected_range().unwrap_or((row, row));
+                            copied = Some(collect_selected_rows_with_numbers(
+                                state, &fileset, s, e, in_result,
+                            ));
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("全选").clicked() {
+                            pane.select_all(total - 1);
+                            ui.close();
+                        }
+                        ui.separator();
+                        // 查找选中词：优先用双击取到的词，否则回退整行（去首尾空白）。
+                        let word = if pane.selected_word.is_empty() {
+                            line.trim().to_string()
+                        } else {
+                            pane.selected_word.clone()
+                        };
+                        if ui.button("查找选中词").clicked() && !word.is_empty() {
+                            search_word = Some(word);
                             ui.close();
                         }
                     });
@@ -409,6 +444,33 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, pane: &mut PaneState, pane_id: 
             pane.scroll_target = Some(target);
         }
     }
+
+    search_word
+}
+
+/// 把 `[start, end]` 区间内的行用「`行号: 内容`」格式连接，供「复制为带行号」使用。
+///
+/// 行号取自 `row_content` 的 `gutter_text`（全量视图是 1 起全局行号，命中视图是
+/// `<文件序>.<行号>`），与正文所见一致。同样受 [`MAX_COPY_ROWS`] 上限约束。
+fn collect_selected_rows_with_numbers(
+    state: &AppState,
+    fileset: &FileSet,
+    start: usize,
+    end: usize,
+    in_result: bool,
+) -> String {
+    let last = end.min(start.saturating_add(MAX_COPY_ROWS).saturating_sub(1));
+    let mut out = String::with_capacity((last - start + 1) * 72);
+    for r in start..=last {
+        if r > start {
+            out.push('\n');
+        }
+        let (line, num) = row_content(state, fileset, r, in_result);
+        out.push_str(&num);
+        out.push_str(": ");
+        out.push_str(&line);
+    }
+    out
 }
 
 /// 把 `[start, end]` 区间内的行文本用 `\n` 连接，供批量复制使用。
@@ -815,5 +877,33 @@ mod tests {
         ];
         let distinct: std::collections::HashSet<_> = all.iter().collect();
         assert_eq!(distinct.len(), 5, "Fatal/Error 同色，其余应各不同：{all:?}");
+    }
+
+    // —— 带行号复制（collect_selected_rows_with_numbers） ——
+
+    /// 在临时目录建一个含 3 行内容的日志文件并索引，返回其 `FileSet`。
+    fn tmp_fileset(name: &str) -> (crate::core::indexer::FileSet, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join("hyper-log-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!("{seq}_{name}"));
+        std::fs::write(&p, "alpha\nbeta gamma\ndelta\n").unwrap();
+        let idx = crate::core::indexer::LogFileIndex::open(&p).unwrap();
+        let mut fs = crate::core::indexer::FileSet::new();
+        fs.push(std::sync::Arc::new(idx));
+        (fs, p)
+    }
+
+    #[test]
+    fn collect_with_numbers_prefixes_each_line_with_1_based_number() {
+        let (fs, p) = tmp_fileset("numbered.log");
+        let s = AppState::default();
+        let out = collect_selected_rows_with_numbers(&s, &fs, 0, 2, false);
+        // 行号从 1 起，`行号: 内容` 逐行拼接
+        assert_eq!(out, "1: alpha\n2: beta gamma\n3: delta");
+        drop(fs);
+        let _ = std::fs::remove_file(&p);
     }
 }
