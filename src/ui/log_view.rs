@@ -212,6 +212,18 @@ pub fn show(
     let mut search_word: Option<String> = None;
     // 行号槽拖动多选：记录本次拖动中指针**悬停**到的那一行（闭包内每帧至多命中一个可见行）。
     let mut drag_hover: Option<usize> = None;
+    // 正文拖选：本帧是否真的拖出了一段文本（用于抑制随后的「点击选中整行」）。
+    let mut text_dragged = false;
+
+    // 指针状态每帧只取一次：正文拖选要按指针 x 反查字符索引，若放在每行闭包里反复
+    // `ui.input()`，可见行越多开销越大（虚拟滚动下每帧约 50–100 行）。
+    let (press_origin, ptr_pos, ptr_down) = ui.input(|i| {
+        (
+            i.pointer.press_origin(),
+            i.pointer.interact_pos(),
+            i.pointer.primary_down(),
+        )
+    });
 
     let out = egui::ScrollArea::both()
         // 各面板必须用不同的 id，否则滚动位置会串（egui 按 Id 存 ScrollArea 状态）。
@@ -286,9 +298,37 @@ pub fn show(
                         )
                         .inner;
 
+                    // 3.5) 正文拖选：按住并横向拖动即选中一段文本，实时写进
+                    //     `pane.selected_word`，供 `⌘F` 带入检索框（VS Code 同款）。
+                    //     egui 不暴露 `Label` 的选区文本（`LabelSelectionState` 只有
+                    //     `has_selection`），故自己按指针 x 反查字符索引。
+                    //     只处理**起点行内**的选区：跨行拖选取不到完整文本，代价大于收益。
+                    if let Some(origin) = press_origin
+                        && row_rect.contains(origin)
+                        && origin.x >= row_rect.min.x + gutter_w
+                    {
+                        let x_off = origin.x - (row_rect.min.x + gutter_w + text_pad);
+                        pane.drag_text =
+                            Some((row, char_index_at_offset(ui, &text, font_size, x_off)));
+                    }
+                    if let Some((anchor_row, anchor_idx)) = pane.drag_text
+                        && anchor_row == row
+                        && ptr_down
+                        && let Some(pos) = ptr_pos
+                        && row_rect.contains(pos)
+                    {
+                        let x_off = pos.x - (row_rect.min.x + gutter_w + text_pad);
+                        let cur = char_index_at_offset(ui, &text, font_size, x_off);
+                        if let Some(s) = selected_text_between(&text, anchor_idx, cur) {
+                            pane.selected_word = s;
+                            text_dragged = true;
+                        }
+                    }
+
                     // 4) 点击选中行、右键复制（Shift+点击 = 扩展选区到该行）
                     let resp = gutter_resp.union(text_resp);
-                    if resp.clicked() {
+                    // 正文里刚拖选过文字就别再选中整行——否则拖完一段文字会连带高亮该行。
+                    if resp.clicked() && !text_dragged {
                         let shift = ui.input(|i| i.modifiers.shift);
                         clicked = Some((row, shift));
                     }
@@ -380,6 +420,10 @@ pub fn show(
         if ui.input(|i| i.pointer.any_released()) {
             pane.drag_anchor = None;
         }
+    }
+    // 正文拖选收尾：松手即清空起点（`primary_down` 为假时不可能还在拖）。
+    if !ptr_down {
+        pane.drag_text = None;
     }
 
     // 行号跳转：消费本面板自己的 scroll_target，直接设置滚动区纵向偏移（行高固定 → row*row_h）。
@@ -617,20 +661,23 @@ fn build_job(
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
     let font = egui::FontId::monospace(font_size);
+    // 命中段除底色外再加粗（VS Code 查找命中观感）：长行里更容易被扫到。
+    // 该族已追加中文兜底，命中的中文不会豆腐块（只是不参与加粗）。
+    let font_hit = theme::mono_bold_id(font_size);
     for seg in crate::highlight::segments(line, hl) {
-        let (text, color, background) = match seg {
-            Segment::Plain(t) => (t, p.text, Color32::TRANSPARENT),
-            Segment::Timestamp(t) => (t, p.timestamp, Color32::TRANSPARENT),
-            Segment::Level(t, lvl) => (t, level_color(lvl, p), Color32::TRANSPARENT),
+        let (text, color, background, font_id) = match seg {
+            Segment::Plain(t) => (t, p.text, Color32::TRANSPARENT, font.clone()),
+            Segment::Timestamp(t) => (t, p.timestamp, Color32::TRANSPARENT, font.clone()),
+            Segment::Level(t, lvl) => (t, level_color(lvl, p), Color32::TRANSPARENT, font.clone()),
             // 命中：保持正常文字色，仅加背景高亮（VS Code 查找命中的观感），
             // 避免低对比的「高亮文字」盖住内容导致看不清。
-            Segment::Hit(t) => (t, p.text, p.hit_bg),
+            Segment::Hit(t) => (t, p.text, p.hit_bg, font_hit.clone()),
         };
         job.append(
             text,
             0.0,
             egui::TextFormat {
-                font_id: font.clone(),
+                font_id,
                 color,
                 background,
                 ..Default::default()
@@ -691,13 +738,15 @@ fn truncate_for_render(line: &str) -> Cow<'_, str> {
     }
 }
 
-/// 双击时按点击位置（相对行文本起点的 x 偏移）反查字符索引，再取出所在的词。
+/// 把 x 偏移（相对行文本起点）反查成**字符索引**。
 ///
-/// egui 不暴露 `Label` 的选区文本，故走「排版一次 → 用光标位置求字符索引」的路子：
+/// 与 [`word_at_offset`] / 正文拖选共用同一套「排版一次 → `cursor_from_pos`」的路子：
 /// `Painter::layout_no_wrap` 只需 `&self`（不必 `fonts_mut`），单行排版开销可忽略。
-fn word_at_offset(ui: &mut egui::Ui, line: &str, font_size: f32, x_offset: f32) -> Option<String> {
-    if x_offset < 0.0 {
-        return None;
+///
+/// 返回值已夹取到 `line.chars().count()`，调用方可直接用于切片。
+fn char_index_at_offset(ui: &mut egui::Ui, line: &str, font_size: f32, x_offset: f32) -> usize {
+    if x_offset <= 0.0 {
+        return 0;
     }
     let galley = ui.painter().layout_no_wrap(
         line.to_string(),
@@ -705,10 +754,38 @@ fn word_at_offset(ui: &mut egui::Ui, line: &str, font_size: f32, x_offset: f32) 
         // 只为测量位置，颜色不参与渲染
         egui::Color32::WHITE,
     );
-    // `cursor_from_pos` 返回 `CCursor`，其 `.index` 是 `CharIndex`（字符索引），`word_at`
-    // 内部用 `chars[char_idx]` 按字符下标访问，二者一致；`CharIndex` 可 `.into()` 转 usize。
-    let cursor = galley.cursor_from_pos(egui::vec2(x_offset, 0.0));
-    word_at(line, cursor.index.into())
+    // `cursor_from_pos` 返回 `CCursor`，其 `.index` 是 `CharIndex`（字符索引），
+    // 与 `chars[idx]` 的字符下标一致；`CharIndex` 可 `.into()` 转 usize。
+    let idx: usize = galley
+        .cursor_from_pos(egui::vec2(x_offset, 0.0))
+        .index
+        .into();
+    idx.min(line.chars().count())
+}
+
+/// 双击时按点击位置（相对行文本起点的 x 偏移）反查字符索引，再取出所在的词。
+///
+/// egui 不暴露 `Label` 的选区文本，故走「排版一次 → 用光标位置求字符索引」的路子。
+fn word_at_offset(ui: &mut egui::Ui, line: &str, font_size: f32, x_offset: f32) -> Option<String> {
+    if x_offset < 0.0 {
+        return None;
+    }
+    word_at(line, char_index_at_offset(ui, line, font_size, x_offset))
+}
+
+/// 取字符索引 `[a, b)`（两端顺序任意）之间的文本，供正文拖选填充 `⌘F`。
+///
+/// 空选区（两端相等）或纯空白返回 `None`——否则「按一下没拖动」会把空串写进
+/// `selected_word`，反而清掉此前双击取到的词。
+fn selected_text_between(line: &str, a: usize, b: usize) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let (s, e) = (a.min(b).min(chars.len()), a.max(b).min(chars.len()));
+    if s >= e {
+        return None;
+    }
+    let t: String = chars[s..e].iter().collect();
+    let t = t.trim();
+    (!t.is_empty()).then_some(t.to_owned())
 }
 
 /// 取 `char_idx` 所在的词（向两侧扩到词边界）；落在分隔符上或越界时返回 `None`。
@@ -858,6 +935,40 @@ mod tests {
         let ascii = estimate_text_width("aaaa", theme::LOG_FONT_SIZE);
         let cjk = estimate_text_width("中中中中", theme::LOG_FONT_SIZE);
         assert!(cjk > ascii * 1.5, "ascii={ascii}, cjk={cjk}");
+    }
+
+    // —— 正文拖选取文本（selected_text_between） ——
+
+    #[test]
+    fn selected_text_between_takes_range_in_any_order() {
+        let line = "2026-09-07 ERROR 连接数据库失败";
+        // 正选
+        assert_eq!(
+            selected_text_between(line, 0, 10).as_deref(),
+            Some("2026-09-07")
+        );
+        // 反选（从右往左拖）结果相同
+        assert_eq!(
+            selected_text_between(line, 10, 0).as_deref(),
+            Some("2026-09-07")
+        );
+    }
+
+    #[test]
+    fn selected_text_between_rejects_empty_and_blank() {
+        // 两端相等：没拖动，不能把空串写进 selected_word（会清掉此前双击取到的词）
+        assert_eq!(selected_text_between("abc", 1, 1), None);
+        // 纯空白同样视为无选中
+        assert_eq!(selected_text_between("a   b", 1, 4), None);
+        // 越界：夹取到行尾而非 panic
+        assert_eq!(selected_text_between("abc", 1, 99).as_deref(), Some("bc"));
+    }
+
+    #[test]
+    fn selected_text_between_counts_chars_not_bytes() {
+        // 中文是多字节字符，索引必须按字符计：这里 [2,4) 应取到「日志」两字
+        let line = "中文日志内容";
+        assert_eq!(selected_text_between(line, 2, 4).as_deref(), Some("日志"));
     }
 
     // —— 双击取词（word_at / is_word_char） ——

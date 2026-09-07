@@ -131,6 +131,13 @@ pub struct PaneState {
     /// 跟踪一次拖拽手势的起点，拖拽过程中 `selection_anchor` 被固定为 `drag_anchor`、
     /// `selected_row` 跟随指针悬停行，从而实现「按住行号槽上下拖 = 连续多选」。
     pub drag_anchor: Option<usize>,
+    /// 正文拖选进行中时，记录「起点行 + 起点字符索引」；松手即清空。
+    ///
+    /// egui 不暴露 `Label` 的选区文本（`LabelSelectionState` 只有 `has_selection`，
+    /// 拿不到选中的字符串），而 `⌘F` 又需要「把选中文本带入检索框」，故由
+    /// `log_view` 自己按指针 x 反查字符索引，拖动过程中把选区文本写进
+    /// [`Self::selected_word`]。跨行拖选不支持（只取起点行内的部分）。
+    pub drag_text: Option<(usize, usize)>,
     /// 待跳转行号，由该面板自己消费（替代原先的全局 `AppState::scroll_target`）。
     pub scroll_target: Option<usize>,
     /// 折行开关（每面板独立）。
@@ -139,8 +146,11 @@ pub struct PaneState {
     pub max_line_width: f32,
     /// 是否显示检索命中视图（可做到「A 面板全量 + B 面板命中」的对比）。
     pub in_result_mode: bool,
-    /// 最近一次**双击选中的词**（供 `⌘F` 自动带入检索框，VS Code「选词即搜」的轻量版）；
+    /// 最近一次**在正文中选中的文本**（双击取词或拖动选择），供 `⌘F` 自动带入检索框。
     /// 空串表示无。
+    ///
+    /// 两种来源：双击取一个词（见 `log_view::word_at_offset`），或在正文拖动选择一段
+    /// 文本（见 `log_view` 的正文拖选分支）。后者覆盖前者，语义即「当前选中的文本」。
     ///
     /// 存在面板上而不是 `AppState`，是因为取词发生在 `log_view::show` 的行渲染闭包里，
     /// 那里只拿得到 `&mut PaneState`（`state` 是不可变借用，见该函数的借用注释）。
@@ -662,14 +672,16 @@ pub struct LogViewerApp {
 
 /// CJK 兜底字体在 `FontDefinitions::font_data` 中的键名。
 ///
-/// 原为 MiSans（黑体），后 assets/fonts 目录更新为 NotoSerifSC（思源宋体）系列。
-/// 经用户确认改用 **Black 字重（900）**：衬线体的 Regular（400）笔画纤细，同字号下
-/// 视觉明显偏小（用户反复反馈「字小」），Black 字重笔画粗壮，中文观感显著更醒目。
+/// assets/fonts 提供 NotoSerifSC（思源宋体）8 个字重与 SauceCodePro Nerd Font
+/// （等宽代码体）12 个变体。字重选择的核心约束是**与拉丁主字体的字重相称**：
+/// 日志正文拉丁部分固定走 `SauceCodeProNerdFont-Regular`(400)，若中文用
+/// `Black`(900) 会出现「英文细、中文极粗」的割裂感（`Regular`(400) 又因衬线
+/// 笔画纤细在同字号下显小）。取 **`Medium`(500)**：比 Regular 粗一档，暗色主题下
+/// 中文更清晰，与拉丁 400 搭配不突兀。
 ///
 /// 注意命名歧义：**"Black" 是字重（900，超粗），不是"黑体"（无衬线）**——
-/// NotoSerifSC-Black 仍是衬线宋体。它解决「笔画纤细显小」，但衬线与等宽代码体
-/// （SauceCodePro）的风格差异仍在。若日后改为无衬线黑体，只需换本常量的字体文件
-/// 与下方 `include_bytes!` 路径（字宽不受影响：各字重 CJK advance 均为 1.0em）。
+/// NotoSerifSC 全系都是衬线。若要真正的无衬线黑体需另找字体（仓库内暂无）。
+/// 各字重 CJK advance 均为 1.0em，换字重不影响 `WIDE_W` 等字宽估算常量。
 const FONT_CJK: &str = "NotoSerifSC";
 
 /// 等宽主字体在 `FontDefinitions::font_data` 中的键名。
@@ -679,6 +691,16 @@ const FONT_CJK: &str = "NotoSerifSC";
 /// 代码/符号显示更佳，也顺带覆盖了此前「几何/箭头符号字形覆盖不可靠」需自绘
 /// 矢量规避的痛点。
 const FONT_MONO: &str = "SauceCodeProNerdFont";
+
+/// 等宽**粗体**在 `FontDefinitions::font_data` 中的键名。
+///
+/// 单独注册为 [`theme::FONT_FAMILY_MONO_BOLD`] 族（不并入 Monospace，否则全文变粗），
+/// 仅用于检索命中的文本段：VS Code 的查找命中除了底色还有字重强调，命中在长行里
+/// 更容易被肉眼扫到。体积约 2.4MB，可接受。
+///
+/// 该族同样要追加 CJK 兜底——SauceCodePro 无 CJK 字形，否则命中的中文会变豆腐块
+/// （中文因此不参与加粗，回退到 Medium，属可接受的降级）。
+const FONT_MONO_BOLD: &str = "SauceCodeProNerdFontBold";
 
 /// 配置中文字体与等宽字体。
 ///
@@ -698,13 +720,19 @@ fn setup_fonts(ctx: &egui::Context) {
     fonts.font_data.insert(
         FONT_CJK.to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/fonts/NotoSerifSC-Black.ttf"
+            "../assets/fonts/NotoSerifSC-Medium.ttf"
         ))),
     );
     fonts.font_data.insert(
         FONT_MONO.to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
             "../assets/fonts/SauceCodeProNerdFont-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        FONT_MONO_BOLD.to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/SauceCodeProNerdFont-Bold.ttf"
         ))),
     );
 
@@ -726,6 +754,12 @@ fn setup_fonts(ctx: &egui::Context) {
         .entry(egui::FontFamily::Proportional)
         .or_default()
         .push(FONT_CJK.to_owned());
+
+    // 命中强调族：等宽粗体 + 中文兜底（SauceCodePro 无 CJK 字形，缺兜底会豆腐块）。
+    fonts.families.insert(
+        egui::FontFamily::Name(theme::FONT_FAMILY_MONO_BOLD.into()),
+        vec![FONT_MONO_BOLD.to_owned(), FONT_CJK.to_owned()],
+    );
 
     ctx.set_fonts(fonts);
 }
@@ -857,8 +891,9 @@ impl LogViewerApp {
             self.state.pending_open_dir = true;
         }
         if pressed(ctx, cmd, egui::Key::F) {
-            // 双击选过词就把它带入检索框——VS Code「⌘F 带入选中文本」的轻量版：
-            // egui 拿不到 Label 选区文本，故由 `log_view` 在双击时按点击位置反查词并存进面板。
+            // 正文中选中过文本就把它带入检索框——VS Code「⌘F 带入选中文本」的轻量版。
+            // egui 拿不到 Label 选区文本（`LabelSelectionState` 只有 `has_selection`），
+            // 故由 `log_view` 在双击取词 / 拖动选择时按指针 x 反查字符索引，存进面板。
             let word = self
                 .state
                 .active_pane()

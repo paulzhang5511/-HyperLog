@@ -22,6 +22,18 @@ pub const LOG_FONT_SIZE: f32 = 12.5;
 /// 行号字号：略小于正文，弱化其视觉权重，避免与日志内容争夺注意力。
 pub const GUTTER_FONT_SIZE: f32 = 11.0;
 
+/// 等宽**粗体**字体族名，由 `app::setup_fonts` 注册（SauceCodePro Bold + 中文兜底）。
+///
+/// 单独成族而不并入 `FontFamily::Monospace`：后者会让全部界面等宽文本变粗。
+/// 目前仅检索命中的文本段用它（底色 + 字重双重强调）。
+pub const FONT_FAMILY_MONO_BOLD: &str = "MonoBold";
+
+/// 构造命中强调用的粗体 `FontId`。
+#[inline]
+pub fn mono_bold_id(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(FONT_FAMILY_MONO_BOLD.into()))
+}
+
 /// 一套主题的全部色值。既驱动 `egui::Style`，也驱动日志区自绘。
 pub struct Palette {
     /// 中央区（日志正文）背景。
